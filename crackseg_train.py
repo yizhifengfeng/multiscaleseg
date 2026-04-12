@@ -160,21 +160,13 @@ def _accumulate_confusion(logits, target, threshold: float):
 def confusion_to_metrics(tp, fp, fn, tn, eps=1e-7):
     """Dice、前景 IoU、精确率、召回率、F1、mIoU（背景+前景平均）。"""
     iou_fg = (tp + eps) / (tp + fp + fn + eps)
-    iou_bg = (tn + eps) / (tn + fp + fn + eps)
-    miou = (iou_fg + iou_bg) / 2.0
-    precision = (tp + eps) / (tp + fp + eps)
     recall = (tp + eps) / (tp + fn + eps)
     dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
-    f1 = (2.0 * precision * recall + eps) / (precision + recall + eps)
     return {
         "Dice": dice.item(),
         "IoU": iou_fg.item(),
-        "Precision": precision.item(),
         "Recall": recall.item(),
-        "F1": f1.item(),
-        "mIoU": miou.item(),
     }
-
 
 @torch.no_grad()
 def evaluate_metrics_and_loss(model, loader, criterion, device, threshold: float):
@@ -362,9 +354,7 @@ def main():
 
         line = (
             f"Epoch {epoch + 1:3d} | TrainLoss {avg_train:.6f} | ValLoss {avg_val:.6f} | "
-            f"Dice {metrics['Dice']:.6f} | IoU {metrics['IoU']:.6f} | "
-            f"P {metrics['Precision']:.6f} | R {metrics['Recall']:.6f} | "
-            f"F1 {metrics['F1']:.6f} | mIoU {metrics['mIoU']:.6f}\n"
+            f"Dice {metrics['Dice']:.6f} | IoU {metrics['IoU']:.6f} |  R {metrics['Recall']:.6f} | "
         )
         print(line.strip())
         with open(metrics_log_path, "a", encoding="utf-8") as f:
@@ -389,7 +379,7 @@ def main():
             torch.cuda.empty_cache()
 
     # 最终模型与曲线
-    final_path = os.path.join(MODEL_DIR, "crackseg_2060ti_final.pth")
+    final_path = os.path.join(MODEL_DIR, "crackseg_2060ti.pth")
     torch.save(model.state_dict(), final_path)
     curve_path = os.path.join(OUTPUT_ROOT, "loss_curve.png")
     plot_loss_curve(train_losses, val_losses, curve_path)
