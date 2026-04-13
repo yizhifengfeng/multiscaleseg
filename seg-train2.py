@@ -13,8 +13,9 @@ from tqdm import tqdm
 # -----------------------------------------------------------------------------
 # 1. 路径与全局参数
 # -----------------------------------------------------------------------------
-_ROOT = "/kaggle/input/datasets/zhifengfengyi"
-_DEFAULT_DATA = os.path.join(_ROOT, "gaoguangpu")
+# 修改第 18-19 行
+_DEFAULT_DATA = "/kaggle/input/datasets/zhifengfengyi/gaoguangpu" 
+_ROOT = os.path.dirname(_DEFAULT_DATA) # 自动回退一级到 zhifengfengyi
 
 train_img_dir = os.path.join(_DEFAULT_DATA, "img")
 train_mask_dir = os.path.join(_DEFAULT_DATA, "masknpy")
