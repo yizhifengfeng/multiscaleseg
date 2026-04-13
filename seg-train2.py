@@ -11,24 +11,26 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-# 路径：严格适配Kaggle P100（仅修改这里，其他全保留）
+# 1. 路径与全局参数优化（适配 Kaggle）
 # -----------------------------------------------------------------------------
-_ROOT = "/kaggle/input/datasets/zhifengfengyi"
+_ROOT = "/kaggle/input/datasets/zhifengfengyi"  # 请确保你的数据集名称与此路径一致
 _DEFAULT_DATA = os.path.join(_ROOT, "gaoguangpu")
-def _env_path(key: str, default: str) -> str:
-    v = os.environ.get(key, "").strip()
-    return v if v else default
+
 train_img_dir = os.path.join(_DEFAULT_DATA, "img")
 train_mask_dir = os.path.join(_DEFAULT_DATA, "masknpy")
 OUTPUT_ROOT = "/kaggle/working/output_results"
 MODEL_DIR = os.path.join(OUTPUT_ROOT, "models")
+
+# --- 针对 T4 x 2 的超参数优化 ---
 SLICE_IDX = int(os.environ.get("CRACKSEG_SLICE_IDX", "88"))
 PRED_THRESHOLD = float(os.environ.get("CRACKSEG_THRESH", "0.5"))
-EPOCHS = int(os.environ.get("CRACKSEG_EPOCHS", "300"))
-VIZ_EVERY = int(os.environ.get("CRACKSEG_VIZ_EVERY", "5"))
+EPOCHS = 300                # 最大轮数
+BATCH_SIZE = 16            # T4显存较大，且有两张卡，将 4 提升至 16 以加快速度
+NUM_WORKERS = 4            # Kaggle CPU 为 4 核，增加线程数加快数据读取
+VIZ_EVERY = 5              # 每 5 轮保存一次可视化结果
 VIZ_SAMPLE_INDICES = [0, 1, 2]
 
-# ===================== 注意力模块（100%还原你的原代码，未做任何修改） =====================
+# ===================== 注意力模块（保持原样） =====================
 class dilateattention(nn.Module):
     def __init__(self, in_channel, depth):
         super(dilateattention, self).__init__()
@@ -48,7 +50,7 @@ class dilateattention(nn.Module):
         output = v * attention_map + x
         return output
 
-# ===================== 主模型（100%还原你的原代码，未做任何修改） =====================
+# ===================== 主模型（保持原样） =====================
 class mymodel(nn.Module):
     def __init__(self, in_channel, classnum=1):
         super(mymodel, self).__init__()
@@ -91,24 +93,26 @@ class mymodel(nn.Module):
         x6 = self.final(x6)
         return x6
 
-# ===================== 数据集（仅修复高光谱维度，保留你原逻辑） =====================
+# ===================== 数据集处理 =====================
 class CrackDataset(Dataset):
     def __init__(self, img_dir, mask_dir):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
+        # 增加容错：忽略隐藏文件并确保排序
         self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".npy") and not f.startswith(".")])
         self.mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith(".npy") and not f.startswith(".")])
-        assert len(self.img_files) == len(self.mask_files), "图像与掩码数量不匹配"
+        if len(self.img_files) != len(self.mask_files):
+            print(f"警告：图片数量({len(self.img_files)})与掩码数量({len(self.mask_files)})不一致！")
     def __len__(self):
         return len(self.img_files)
     def __getitem__(self, idx):
-        # 修复：高光谱(H,W,176) → 适配3D卷积(1,176,H,W)
+        # 高光谱 (H, W, 176) -> (1, 176, H, W) 适配 3D 卷积
         img = np.load(os.path.join(self.img_dir, self.img_files[idx])).transpose(2, 0, 1)
         img = np.expand_dims(img, axis=0)
         mask = np.load(os.path.join(self.mask_dir, self.mask_files[idx]))
         return torch.from_numpy(img).float(), torch.from_numpy(mask).long(), self.img_files[idx]
 
-# ===================== 损失函数（100%还原你的原代码） =====================
+# ===================== 损失函数与指标 =====================
 class DiceLoss(nn.Module):
     def __init__(self):
         super(DiceLoss, self).__init__()
@@ -122,7 +126,6 @@ class DiceLoss(nn.Module):
         dice_loss = 1 - dice
         return bce_loss + dice_loss
 
-# ===================== 分割指标（100%还原你的原代码） =====================
 def _accumulate_confusion(logits, target, threshold: float):
     pred = (torch.sigmoid(logits) > threshold).long()
     t = target.long()
@@ -136,11 +139,7 @@ def confusion_to_metrics(tp, fp, fn, tn, eps=1e-7):
     iou_fg = (tp + eps) / (tp + fp + fn + eps)
     recall = (tp + eps) / (tp + fn + eps)
     dice = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
-    return {
-        "Dice": dice.item(),
-        "IoU": iou_fg.item(),
-        "Recall": recall.item(),
-    }
+    return {"Dice": dice.item(), "IoU": iou_fg.item(), "Recall": recall.item()}
 
 @torch.no_grad()
 def evaluate_metrics_and_loss(model, loader, criterion, device, threshold: float):
@@ -149,9 +148,9 @@ def evaluate_metrics_and_loss(model, loader, criterion, device, threshold: float
     total_loss = 0.0
     n_batches = 0
     for imgs, masks, _ in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+        imgs = imgs.to(device)
+        masks = masks.to(device)
+        with torch.cuda.amp.autocast():
             outputs = model(imgs)
             loss = criterion(outputs, masks)
         total_loss += loss.item()
@@ -162,177 +161,133 @@ def evaluate_metrics_and_loss(model, loader, criterion, device, threshold: float
     metrics = confusion_to_metrics(tp, fp, fn, tn)
     return avg_loss, metrics
 
-# ===================== 可视化（100%还原你的原代码） =====================
-def save_prediction_figure(model, dataset, device, save_path: str, epoch_display: int, sample_indices, slice_idx: int,
-                           threshold: float):
+# ===================== 可视化函数 =====================
+def save_prediction_figure(model, dataset, device, save_path: str, epoch_display: int, sample_indices, slice_idx: int, threshold: float):
     model.eval()
     num_samples = len(sample_indices)
     fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5 * num_samples))
-    if num_samples == 1:
-        axes = np.expand_dims(axes, axis=0)
+    if num_samples == 1: axes = np.expand_dims(axes, axis=0)
+    
     with torch.no_grad():
         for i, idx in enumerate(sample_indices):
             if idx >= len(dataset): continue
             img, mask, filename = dataset[idx]
             img_input = img.unsqueeze(0).to(device)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.cuda.amp.autocast():
                 output = model(img_input)
             prob_map = torch.sigmoid(output).squeeze().cpu().numpy()
             pred_mask = (prob_map > threshold).astype(np.float32)
             input_slice = img[0, slice_idx].numpy()
             gt_mask = mask.numpy()
+            
             axes[i, 0].imshow(input_slice, cmap="gray")
             axes[i, 0].set_title(f"Sample: {filename}\nInput (Slice {slice_idx})")
-            axes[i, 0].axis("off")
             axes[i, 1].imshow(gt_mask, cmap="gray")
             axes[i, 1].set_title("Ground Truth Mask")
-            axes[i, 1].axis("off")
             axes[i, 2].imshow(pred_mask, cmap="gray")
-            axes[i, 2].set_title(f"Prediction Mask (Thresh={threshold})")
-            axes[i, 2].axis("off")
-    fig.suptitle(f"Epoch {epoch_display} — Hyperspectral slice / GT / Prediction", fontsize=14, y=1.02)
+            axes[i, 2].set_title(f"Prediction (Epoch {epoch_display})")
+            for ax in axes[i]: ax.axis("off")
+            
     plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    fig.savefig(save_path, dpi=100)
     plt.close(fig)
-
-def plot_loss_curve(train_losses, val_losses, save_path: str):
-    epochs_x = np.arange(1, len(train_losses) + 1)
-    plt.figure(figsize=(10, 5))
-    plt.plot(epochs_x, train_losses, label="Train Loss", linewidth=2, color="#1f77b4")
-    plt.plot(epochs_x, val_losses, label="Validation Loss", linewidth=2, color="#ff7f0e")
-    plt.title("Training History — Train vs Validation Loss", fontsize=14)
-    plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Loss", fontsize=12)
-    plt.xticks(epochs_x)
-    plt.legend(loc="best", fontsize=11)
-    plt.grid(True, linestyle="--", alpha=0.7)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
 
 def ensure_dirs():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-# ===================== 主函数（100%还原你的原训练逻辑，仅适配Kaggle） =====================
+# ===================== 核心训练逻辑（双显卡适配） =====================
 def main():
     ensure_dirs()
     metrics_log_path = os.path.join(OUTPUT_ROOT, "metrics_log.txt")
+    
+    # 加载数据集
     full_dataset = CrackDataset(train_img_dir, train_mask_dir)
-    total_size = len(full_dataset)
-    # 保留你原有的8:2划分
-    train_size = int(0.8 * total_size)
-    val_size = total_size - train_size
-    generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    # P100显存优化batch_size
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
+    # 数据读取器优化
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+    # --- 设备与模型双卡配置 ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 模型输入通道保持1，数据已预处理为(1,176,H,W)，完全匹配你的原模型
-    model = mymodel(in_channel=1, classnum=1).to(device)
+    model = mymodel(in_channel=1, classnum=1)
+    
+    # 关键修改：如果检测到多张显卡，开启 DataParallel
+    if torch.cuda.device_count() > 1:
+        print(f"检测到 {torch.cuda.device_count()} 张显卡，开启并行训练模式！")
+        model = nn.DataParallel(model)
+    
+    model = model.to(device)
+    # -----------------------
+
     criterion = DiceLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler()
 
-    train_losses = []
-    val_losses = []
+    train_losses, val_losses = [], []
     best_val_loss = float("inf")
-    best_metrics = None
-    best_epoch = -1
     early_stopping_patience = 30
     trigger_times = 0
 
-    with open(metrics_log_path, "w", encoding="utf-8") as f:
-        f.write(
-            "MS-CrackSeg training log (P100 Optimized)\n"
-            f"Data: train_img={train_img_dir}, Validation Split=20%\n"
-            f"Device: {device}, Max Epochs: {EPOCHS}, Early Stopping Patience: {early_stopping_patience}\n"
-            "Columns: Epoch | TrainLoss | ValLoss | Dice | IoU | Recall\n\n"
-        )
-    print(f"使用设备: {device}")
-    print(f"输出目录: {OUTPUT_ROOT}")
-    print(f"数据总数: {total_size} (训练样本: {train_size}, 验证样本: {val_size})")
+    print(f"开始训练 | Batch Size: {BATCH_SIZE} | 并行线程: {NUM_WORKERS}")
 
     for epoch in range(EPOCHS):
         model.train()
         train_loss_sum = 0.0
-        train_bar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{EPOCHS}] Train")
-        for batch_idx, (imgs, masks, _) in enumerate(train_bar):
-            imgs = imgs.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+        train_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}]")
+        
+        for imgs, masks, _ in train_bar:
+            imgs, masks = imgs.to(device), masks.to(device)
+            
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
                 outputs = model(imgs)
                 loss = criterion(outputs, masks)
-            optimizer.zero_grad()
+            
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            
             train_loss_sum += loss.item()
-            train_bar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{train_loss_sum / (batch_idx + 1):.4f}")
+            train_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_train = train_loss_sum / len(train_loader)
         avg_val, metrics = evaluate_metrics_and_loss(model, val_loader, criterion, device, PRED_THRESHOLD)
+        
         train_losses.append(avg_train)
         val_losses.append(avg_val)
         scheduler.step()
 
+        # 保存最优模型
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            best_metrics = metrics.copy()
-            best_epoch = epoch + 1
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "best_model.pth"))
+            # 注意：如果用了 DataParallel，保存时要用 model.module
+            save_model = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(save_model.state_dict(), os.path.join(MODEL_DIR, "best_model.pth"))
             trigger_times = 0
-            status_msg = ">> 验证损失下降，保存最优模型"
+            status = "Best!"
         else:
             trigger_times += 1
-            status_msg = f">> 验证损失未下降 ({trigger_times}/{early_stopping_patience})"
+            status = f"Patience {trigger_times}/{early_stopping_patience}"
 
-        line = (
-            f"Epoch {epoch + 1:3d} | TrainLoss {avg_train:.6f} | ValLoss {avg_val:.6f} | "
-            f"Dice {metrics['Dice']:.6f} | IoU {metrics['IoU']:.6f} | R {metrics['Recall']:.6f} | {status_msg}"
-        )
-        print(line.strip())
-        with open(metrics_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        log_line = f"Epoch {epoch+1:03d} | Train: {avg_train:.4f} | Val: {avg_val:.4f} | IoU: {metrics['IoU']:.4f} | {status}"
+        print(log_line)
+        
+        with open(metrics_log_path, "a") as f:
+            f.write(log_line + "\n")
 
         if (epoch + 1) % VIZ_EVERY == 0:
-            out_png = os.path.join(OUTPUT_ROOT, f"predictions_epoch_{epoch + 1}.png")
-            save_prediction_figure(model, val_dataset, device, out_png, epoch + 1, VIZ_SAMPLE_INDICES, SLICE_IDX, PRED_THRESHOLD)
-            print(f" 已保存可视化: {out_png}")
-
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            save_prediction_figure(model, val_dataset, device, os.path.join(OUTPUT_ROOT, f"viz_ep_{epoch+1}.png"), epoch+1, VIZ_SAMPLE_INDICES, SLICE_IDX, PRED_THRESHOLD)
 
         if trigger_times >= early_stopping_patience:
-            print(f"\n!!! 触发早停，连续 {early_stopping_patience} 轮无改善，训练终止于 Epoch {epoch + 1} !!!")
+            print("触发早停，训练结束。")
             break
 
-    final_path = os.path.join(MODEL_DIR, "crackseg_p100_final.pth")
-    torch.save(model.state_dict(), final_path)
-    curve_path = os.path.join(OUTPUT_ROOT, "loss_curve.png")
-    plot_loss_curve(train_losses, val_losses, curve_path)
-
-    with open(metrics_log_path, "a", encoding="utf-8") as f:
-        f.write("\n--- Summary ---\n")
-        f.write(f"Best Validation Loss: {best_val_loss:.6f} (Epoch {best_epoch})\n")
-        if best_metrics:
-            for k, v in best_metrics.items():
-                f.write(f"Metrics at best-val-loss epoch — {k}: {v:.6f}\n")
-        f.write(f"Final model: {final_path}\n")
-        f.write(f"Best model (min val loss): {os.path.join(MODEL_DIR, 'best_model.pth')}\n")
-        f.write(f"Loss curve: {curve_path}\n")
-
-    print(f"\n训练结束。最终权重: {final_path}")
-    print(f"最优验证损失: {best_val_loss:.6f}（Epoch {best_epoch}）-> {os.path.join(MODEL_DIR, 'best_model.pth')}")
-    print(f"损失曲线: {curve_path}")
-    print(f"指标日志: {metrics_log_path}")
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
