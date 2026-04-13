@@ -187,11 +187,18 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = mymodel(in_channel=1, classnum=1)
+    
     if torch.cuda.device_count() > 1:
         print(f"激活双显卡模式！检测到 {torch.cuda.device_count()} 张 T4")
         model = nn.DataParallel(model)
     model = model.to(device)
-
+# === 新增：自动加载断点 ===
+    checkpoint_path = os.path.join(MODEL_DIR, "best_model.pth")
+    if os.path.exists(checkpoint_path):
+        print(f"检测到已有存档，正在加载权重继续训练...")
+        model.load_state_dict(torch.load(checkpoint_path))
+    # ========================
+    
     criterion = DiceLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
