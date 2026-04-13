@@ -193,27 +193,23 @@ def main():
         model = nn.DataParallel(model)
     model = model.to(device)
     
-# === 修正后的：自动加载断点（解决 DataParallel 权重冲突） ===
+# === 增强版：自动处理单/双显卡权重冲突 ===
     checkpoint_path = os.path.join(MODEL_DIR, "best_model.pth")
     if os.path.exists(checkpoint_path):
-        print(f"检测到已有存档，正在处理权重并加载...")
+        print(f"检测到历史存档，正在加载权重...")
         state_dict = torch.load(checkpoint_path, map_location=device)
         
-        # 判断当前模型是否被 DataParallel 包装
-        is_dataparallel_model = isinstance(model, nn.DataParallel)
-        # 判断权重文件是否包含 'module.' 前缀
-        has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+        # 自动移除或添加 DataParallel 产生的 'module.' 前缀
+        is_dp = isinstance(model, nn.DataParallel)
+        has_prefix = any(k.startswith('module.') for k in state_dict.keys())
 
-        if is_dataparallel_model and not has_module_prefix:
-            # 模式 1：模型有 module，权重没有 -> 给权重加上 module.
+        if is_dp and not has_prefix:
             state_dict = {"module." + k: v for k, v in state_dict.items()}
-        elif not is_dataparallel_model and has_module_prefix:
-            # 模式 2：模型没有 module，权重有 -> 去掉权重的 module.
+        elif not is_dp and has_prefix:
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
             
         model.load_state_dict(state_dict)
-        print(f"成功恢复训练状态！")
-    # =======================================================
+        print(f"权重成功加载！将从上次最好的结果继续训练。")
     
     criterion = DiceLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
