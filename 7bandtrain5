@@ -88,13 +88,9 @@ class Config:
     cutout_prob: float = 0.25
     cutout_size: int = 20
 
-    threshold_min: float = 0.35
-    threshold_max: float = 0.85
-    threshold_step: float = 0.025
-    min_recall_for_threshold: float = 0.45
     default_threshold: float = 0.55
 
-    viz_every: int = 10
+    viz_every: int = 0
     viz_band_idx: int = 3
     viz_sample_count: int = 3
 
@@ -537,9 +533,10 @@ class PrecisionAwareSegLoss(nn.Module):
 @torch.no_grad()
 def collect_predictions(model, loader, device):
     model.eval()
-    all_probs = []
-    all_masks = []
     total_loss = 0.0
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
     criterion = PrecisionAwareSegLoss().to(device)
 
     for imgs, masks, _ in loader:
@@ -550,78 +547,34 @@ def collect_predictions(model, loader, device):
             loss = criterion(logits, masks)
         total_loss += loss.item()
 
-        probs = torch.sigmoid(logits).detach().cpu().numpy()
-        masks_np = masks.detach().cpu().numpy()
-        all_probs.append(probs)
-        all_masks.append(masks_np)
+        probs = torch.sigmoid(logits)
+        pred = (probs > CFG.default_threshold).long().squeeze(1)
+        true = (masks > 0.5).long()
 
-    if not all_probs:
-        return 0.0, np.zeros((0, 1, 1, 1), dtype=np.float32), np.zeros((0, 1, 1), dtype=np.float32)
+        total_tp += ((pred == 1) & (true == 1)).sum().item()
+        total_fp += ((pred == 1) & (true == 0)).sum().item()
+        total_fn += ((pred == 0) & (true == 1)).sum().item()
 
-    all_probs = np.concatenate(all_probs, axis=0)
-    all_masks = np.concatenate(all_masks, axis=0)
-    return total_loss / max(len(loader), 1), all_probs, all_masks
+    if len(loader) == 0:
+        return 0.0, {'IoU': 0.0, 'F1': 0.0, 'Precision': 0.0, 'Recall': 0.0}
+
+    metrics = compute_metrics_from_counts(total_tp, total_fp, total_fn)
+    return total_loss / max(len(loader), 1), metrics
 
 
-def compute_binary_metrics_from_arrays(probs, masks, threshold):
-    pred = (probs > threshold).astype(np.uint8)
-    true = (masks > 0.5).astype(np.uint8)
-
-    tp = float(np.sum((pred == 1) & (true == 1)))
-    fp = float(np.sum((pred == 1) & (true == 0)))
-    fn = float(np.sum((pred == 0) & (true == 1)))
-    tn = float(np.sum((pred == 0) & (true == 0)))
+def compute_metrics_from_counts(tp, fp, fn):
     eps = 1e-7
-
     precision = (tp + eps) / (tp + fp + eps)
     recall = (tp + eps) / (tp + fn + eps)
     f1 = 2.0 * precision * recall / (precision + recall + eps)
-    beta2 = 0.5 ** 2
-    f05 = (1.0 + beta2) * precision * recall / (beta2 * precision + recall + eps)
     iou = (tp + eps) / (tp + fp + fn + eps)
-    specificity = (tn + eps) / (tn + fp + eps)
-    accuracy = (tp + tn + eps) / (tp + fp + fn + tn + eps)
-    fpr = (fp + eps) / (fp + tn + eps)
 
     return {
         'Precision': precision,
         'Recall': recall,
         'F1': f1,
-        'F0.5': f05,
         'IoU': iou,
-        'Specificity': specificity,
-        'Accuracy': accuracy,
-        'FPR': fpr,
-        'TP': tp,
-        'FP': fp,
-        'FN': fn,
-        'TN': tn,
     }
-
-
-def choose_best_threshold(probs, masks):
-    best_thr = CFG.default_threshold
-    best_metrics = compute_binary_metrics_from_arrays(probs, masks, best_thr)
-    best_score = -1.0
-
-    thresholds = np.arange(CFG.threshold_min, CFG.threshold_max + 1e-9, CFG.threshold_step)
-    for thr in thresholds:
-        m = compute_binary_metrics_from_arrays(probs, masks, float(thr))
-        if m['Recall'] < CFG.min_recall_for_threshold:
-            continue
-
-        score = (
-            0.45 * m['F0.5'] +
-            0.30 * m['Precision'] +
-            0.20 * m['IoU'] +
-            0.05 * m['Specificity']
-        )
-        if score > best_score:
-            best_score = score
-            best_thr = float(thr)
-            best_metrics = m
-
-    return best_thr, best_metrics, best_score
 
 
 # ================================================================
@@ -631,18 +584,10 @@ class TrainingLogger:
     def __init__(self, path):
         self.path = path
         self.h = {
-            'train_loss': [],
-            'val_loss': [],
             'iou': [],
             'f1': [],
-            'f05': [],
             'precision': [],
-            'recall': [],
-            'specificity': [],
-            'fpr': [],
-            'lr': [],
-            'best_thr': [],
-            'score': []
+            'recall': []
         }
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
@@ -651,60 +596,36 @@ class TrainingLogger:
                 if k in saved:
                     self.h[k] = saved[k]
 
-    def log(self, train_loss, val_loss, metrics, lr, best_thr, score):
-        self.h['train_loss'].append(float(train_loss))
-        self.h['val_loss'].append(float(val_loss))
+    def log(self, metrics):
         self.h['iou'].append(float(metrics['IoU']))
         self.h['f1'].append(float(metrics['F1']))
-        self.h['f05'].append(float(metrics['F0.5']))
         self.h['precision'].append(float(metrics['Precision']))
         self.h['recall'].append(float(metrics['Recall']))
-        self.h['specificity'].append(float(metrics['Specificity']))
-        self.h['fpr'].append(float(metrics['FPR']))
-        self.h['lr'].append(float(lr))
-        self.h['best_thr'].append(float(best_thr))
-        self.h['score'].append(float(score))
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(self.h, f, indent=2, ensure_ascii=False)
 
     def plot(self, path):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-        axes[0, 0].plot(self.h['train_loss'], label='Train')
-        axes[0, 0].plot(self.h['val_loss'], label='Val')
-        axes[0, 0].set_title('Loss')
+        axes[0, 0].plot(self.h['iou'], label='IoU')
+        axes[0, 0].set_title('IoU')
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
 
-        axes[0, 1].plot(self.h['iou'], label='IoU')
-        axes[0, 1].plot(self.h['f1'], label='F1')
-        axes[0, 1].plot(self.h['f05'], label='F0.5')
-        axes[0, 1].set_title('Val Metrics')
+        axes[0, 1].plot(self.h['f1'], label='F1', color='tab:orange')
+        axes[0, 1].set_title('F1')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
 
-        axes[0, 2].plot(self.h['precision'], label='Precision')
-        axes[0, 2].plot(self.h['recall'], label='Recall')
-        axes[0, 2].plot(self.h['specificity'], label='Specificity')
-        axes[0, 2].set_title('PR / Specificity')
-        axes[0, 2].legend()
-        axes[0, 2].grid(True, alpha=0.3)
-
-        axes[1, 0].plot(self.h['fpr'], label='FPR', color='purple')
-        axes[1, 0].set_title('False Positive Rate')
+        axes[1, 0].plot(self.h['precision'], label='Precision', color='tab:green')
+        axes[1, 0].set_title('Precision')
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
 
-        axes[1, 1].plot(self.h['lr'], label='LR', color='red')
-        axes[1, 1].set_title('Learning Rate')
-        axes[1, 1].set_yscale('log')
+        axes[1, 1].plot(self.h['recall'], label='Recall', color='tab:red')
+        axes[1, 1].set_title('Recall')
+        axes[1, 1].legend()
         axes[1, 1].grid(True, alpha=0.3)
-
-        axes[1, 2].plot(self.h['best_thr'], label='Best Threshold', color='green')
-        axes[1, 2].plot(self.h['score'], label='Composite Score', color='black')
-        axes[1, 2].set_title('Threshold / Score')
-        axes[1, 2].legend()
-        axes[1, 2].grid(True, alpha=0.3)
 
         plt.tight_layout()
         fig.savefig(path, dpi=120)
@@ -854,7 +775,6 @@ def main():
 
     start_epoch = 0
     best_score = -1.0
-    best_threshold = CFG.default_threshold
     best_metrics = None
     patience_counter = 0
 
@@ -868,7 +788,6 @@ def main():
         ema.shadow = {k: v.to(device) for k, v in ckpt['ema_shadow'].items()}
         start_epoch = ckpt['epoch']
         best_score = ckpt.get('best_score', -1.0)
-        best_threshold = ckpt.get('best_threshold', CFG.default_threshold)
         best_metrics = ckpt.get('best_metrics', None)
         patience_counter = ckpt.get('patience_counter', 0)
 
@@ -876,7 +795,7 @@ def main():
     print("7 波段训练 v5：Precision 优先 + 分组验证 + 快速收敛")
     print(f"epochs={CFG.epochs}, batch={CFG.batch_size}, lr={CFG.lr}, min_lr={CFG.min_lr}")
     print(f"pos_weight={CFG.pos_weight}, tversky_alpha={CFG.tversky_alpha}, tversky_beta={CFG.tversky_beta}")
-    print(f"hard_negative_ratio={CFG.hard_negative_ratio}, patience={CFG.patience}")
+    print(f"hard_negative_ratio={CFG.hard_negative_ratio}, patience={CFG.patience}, thr={CFG.default_threshold:.2f}")
     print("=" * 68)
 
     for epoch in range(start_epoch, CFG.epochs):
@@ -915,24 +834,23 @@ def main():
             continue
 
         ema.apply_shadow()
-        val_loss, val_probs, val_masks = collect_predictions(model, val_loader, device)
-        threshold, metrics, score = choose_best_threshold(val_probs, val_masks)
+        val_loss, metrics = collect_predictions(model, val_loader, device)
         ema.restore()
 
         train_loss = running_loss / batch_count
         current_lr = optimizer.param_groups[0]['lr']
-        logger.log(train_loss, val_loss, metrics, current_lr, threshold, score)
+        score = metrics['IoU']
+        logger.log(metrics)
 
         improved = score > best_score
         if improved:
             best_score = score
-            best_threshold = threshold
             best_metrics = copy.deepcopy(metrics)
             patience_counter = 0
             ema.apply_shadow()
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'best_threshold': best_threshold,
+                'best_threshold': CFG.default_threshold,
                 'best_metrics': best_metrics,
                 'config': asdict(CFG),
             }, CHECKPOINT)
@@ -950,19 +868,18 @@ def main():
             'scaler_state_dict': scaler.state_dict(),
             'ema_shadow': ema.shadow,
             'best_score': best_score,
-            'best_threshold': best_threshold,
             'best_metrics': best_metrics,
             'patience_counter': patience_counter,
         }, LATEST_CHECKPOINT)
 
         print(
             f"Ep{ep:03d} | Tr:{train_loss:.4f} Va:{val_loss:.4f} | "
-            f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} F0.5:{metrics['F0.5']:.4f} | "
-            f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} Spec:{metrics['Specificity']:.4f} | "
-            f"FPR:{metrics['FPR']:.4f} Thr:{threshold:.3f} Score:{score:.4f} LR:{current_lr:.2e}{tag}"
+            f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} | "
+            f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} | "
+            f"Thr:{CFG.default_threshold:.3f} LR:{current_lr:.2e}{tag}"
         )
 
-        if ep % CFG.viz_every == 0:
+        if CFG.viz_every > 0 and ep % CFG.viz_every == 0:
             ema.apply_shadow()
             save_prediction_figure(
                 model,
@@ -970,7 +887,7 @@ def main():
                 device,
                 os.path.join(OUTPUT_ROOT, f"viz_ep{ep:03d}.png"),
                 ep,
-                threshold
+                CFG.default_threshold
             )
             ema.restore()
 
@@ -982,12 +899,11 @@ def main():
     print("=" * 68)
     print("训练完成")
     print(f"最佳综合分数: {best_score:.4f}")
-    print(f"最佳阈值: {best_threshold:.3f}")
+    print(f"固定阈值: {CFG.default_threshold:.3f}")
     if best_metrics is not None:
         print(
             f"最佳指标 => IoU:{best_metrics['IoU']:.4f}, F1:{best_metrics['F1']:.4f}, "
-            f"F0.5:{best_metrics['F0.5']:.4f}, Precision:{best_metrics['Precision']:.4f}, "
-            f"Recall:{best_metrics['Recall']:.4f}, Specificity:{best_metrics['Specificity']:.4f}"
+            f"Precision:{best_metrics['Precision']:.4f}, Recall:{best_metrics['Recall']:.4f}"
         )
     print(f"最佳模型: {CHECKPOINT}")
     print(f"断点文件: {LATEST_CHECKPOINT}")
