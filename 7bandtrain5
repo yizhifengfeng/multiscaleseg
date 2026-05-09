@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""
+MS-CrackSeg 7 波段训练脚本 v5
+=================================
+
+核心目标：
+1. 缩短无效训练周期，提升收敛效率。
+2. 抑制假阳性，重点改善 Precision 偏低问题。
+3. 降低验证集与测试集性能落差，增强泛化能力。
+4. 保持单文件可运行，便于直接替换训练流程。
+
+相对 [`reduction_band/7bandtrain4.py`](reduction_band/7bandtrain4.py:1) 的关键改进：
+- 使用“按场景分组”的训练/验证划分，降低相邻切块泄漏导致的虚高验证指标。
+- 使用独立训练集/验证集对象，避免共享增强状态。
+- 采用更强调抑制假阳性的损失：BCE + Tversky + Hard Negative Penalty。
+- 验证阈值不再只追求 IoU，而是优先优化 F0.5 / Precision 导向的综合分数。
+- 使用 Warmup + Cosine 调度替代长周期 OneCycle，配合早停减少无效 epoch。
+- 加入 band-jitter / cutout / 更稳健的数据增强与更稳定的归一化。
+- 保存最佳阈值与完整训练配置，便于预测阶段严格对齐。
+"""
+
+import os
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+
+import copy
+import json
+import math
+import random
+import re
+from dataclasses import dataclass, asdict
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+
+# ================================================================
+# 1. 配置
+# ================================================================
+@dataclass
+class Config:
+    # 数据路径：优先使用当前工程相对路径，若不存在则回退到 Linux 路径
+    workspace_data_root: str = os.path.join("reduction_band", "7selectband")
+    linux_data_root: str = r"/root/autodl-tmp/reduction_band/7selectband"
+
+    output_root_win: str = os.path.join("reduction_band", "output_results_7band", "output5")
+    output_root_linux: str = r"/root/autodl-tmp/reduction_band/output_results_7band/output5"
+
+    in_channels: int = 7
+    epochs: int = 180
+    batch_size: int = 12
+    lr: float = 2.5e-4
+    min_lr: float = 8e-7
+    warmup_epochs: int = 8
+    weight_decay: float = 1e-4
+    patience: int = 24
+    num_workers: int = 0
+    grad_clip: float = 1.0
+    seed: int = 42
+
+    train_ratio: float = 0.75
+    base_dim: int = 32
+    dropout: float = 0.18
+    ema_decay: float = 0.998
+
+    # 旧版本正样本惩罚过强，导致 recall 高、precision 低
+    pos_weight: float = 3.5
+    bce_weight: float = 0.30
+    tversky_weight: float = 0.45
+    focal_weight: float = 0.15
+    hard_negative_weight: float = 0.10
+    focal_gamma: float = 2.0
+    tversky_alpha: float = 0.72   # 更高 alpha => 更重罚 FP
+    tversky_beta: float = 0.28
+    label_smoothing: float = 0.02
+    hard_negative_ratio: float = 0.02
+
+    mixup_alpha: float = 0.0      # 分割任务中对细裂缝会模糊边界，默认关闭
+    band_drop_prob: float = 0.15
+    band_noise_prob: float = 0.25
+    cutout_prob: float = 0.25
+    cutout_size: int = 20
+
+    threshold_min: float = 0.35
+    threshold_max: float = 0.85
+    threshold_step: float = 0.025
+    min_recall_for_threshold: float = 0.45
+    default_threshold: float = 0.55
+
+    viz_every: int = 10
+    viz_band_idx: int = 3
+    viz_sample_count: int = 3
+
+
+CFG = Config()
+
+
+def resolve_data_root():
+    if os.path.isdir(CFG.workspace_data_root):
+        return CFG.workspace_data_root
+    return CFG.linux_data_root
+
+
+def resolve_output_root():
+    if os.name == 'nt':
+        return CFG.output_root_win
+    return CFG.output_root_linux
+
+
+DATA_ROOT = resolve_data_root()
+IMG_DIR = os.path.join(DATA_ROOT, "img")
+MASK_DIR = os.path.join(DATA_ROOT, "masknpy")
+OUTPUT_ROOT = resolve_output_root()
+MODEL_DIR = os.path.join(OUTPUT_ROOT, "models")
+TRAIN_LOG = os.path.join(OUTPUT_ROOT, "training_log_7band_v5.json")
+CONFIG_PATH = os.path.join(OUTPUT_ROOT, "training_config_7band_v5.json")
+CHECKPOINT = os.path.join(MODEL_DIR, "7band_best_model_v5.pth")
+LATEST_CHECKPOINT = os.path.join(MODEL_DIR, "latest_checkpoint_v5.pth")
+
+
+# ================================================================
+# 2. 基础工具
+# ================================================================
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dirs():
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+
+def save_config():
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(asdict(CFG), f, indent=2, ensure_ascii=False)
+
+
+def extract_key(filename: str) -> str:
+    stem = filename.replace('.npy', '')
+    m = re.search(r'r\dc\d+col\d+row\d+', stem)
+    if m:
+        return m.group()
+    m = re.search(r'col\d+row\d+', stem)
+    if m:
+        return m.group()
+    return stem
+
+
+def extract_group_id(key: str) -> str:
+    """
+    用于按场景分组切分，减少相邻切块同时落入训练/验证集导致的指标泄漏。
+    优先提取 r?c? 作为分组；若无法提取，再退化为去除 row/col 细粒度位置。
+    """
+    m = re.search(r'(r\dc\d+)', key)
+    if m:
+        return m.group(1)
+    key2 = re.sub(r'col\d+', 'colX', key)
+    key2 = re.sub(r'row\d+', 'rowY', key2)
+    return key2
+
+
+def beta_mixup(imgs, masks, alpha, device):
+    if alpha <= 0 or imgs.size(0) < 2:
+        return imgs, masks
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(imgs.size(0), device=device)
+    mixed_imgs = lam * imgs + (1.0 - lam) * imgs[perm]
+    mixed_masks = lam * masks + (1.0 - lam) * masks[perm]
+    return mixed_imgs, mixed_masks
+
+
+# ================================================================
+# 3. EMA
+# ================================================================
+class EMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name].clone()
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+# ================================================================
+# 4. 模型定义
+# ================================================================
+class MSSK(nn.Module):
+    def __init__(self, in_channels, out_channels=None, dropout=0.18):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        branch = max(out_channels // 4, 8)
+        self.conv1x1 = nn.Conv2d(in_channels, branch, kernel_size=1)
+        self.conv3x3 = nn.Conv2d(in_channels, branch, kernel_size=3, padding=1)
+        self.conv5x5 = nn.Conv2d(in_channels, branch, kernel_size=5, padding=2)
+        self.conv7x7 = nn.Conv2d(in_channels, branch, kernel_size=7, padding=3)
+        self.fusion = nn.Conv2d(branch * 4, out_channels, kernel_size=1)
+        self.norm = nn.GroupNorm(8, out_channels)
+        self.dropout = nn.Dropout2d(dropout)
+        self.act = nn.SiLU(inplace=True)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = torch.cat([
+            self.conv1x1(x),
+            self.conv3x3(x),
+            self.conv5x5(x),
+            self.conv7x7(x)
+        ], dim=1)
+        out = self.fusion(out)
+        out = self.norm(out)
+        out = self.dropout(out)
+        out = self.act(out + residual)
+        return out
+
+
+class DilateAttention(nn.Module):
+    def __init__(self, in_channel, depth):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, in_channel)
+        self.relu = nn.ReLU(inplace=True)
+        self.v = nn.Conv2d(in_channel, depth, 1, 1)
+        self.q = nn.Conv2d(in_channel, depth, 3, 1, padding=2, dilation=2)
+        self.k = nn.Conv2d(in_channel, depth, 3, 1, padding=4, dilation=4)
+        self.out = nn.Conv2d(depth, depth, kernel_size=1)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(depth, depth, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        v = self.v(x)
+        attn = torch.softmax(self.q(x) * self.k(x), dim=1)
+        out = v * attn
+        out = self.out(out)
+        out = out * self.gate(out)
+        out = out + self.relu(self.norm(x))
+        return out
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.fuse = MSSK(out_channels + skip_channels, out_channels, dropout=dropout)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.fuse(x)
+
+
+class CrackSeg7BandV5(nn.Module):
+    def __init__(self, in_channels=7, base_dim=32, dropout=0.18):
+        super().__init__()
+        d = base_dim
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+        )
+
+        self.enc1 = MSSK(d, d, dropout=dropout)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = MSSK(d, d * 2, dropout=dropout)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = MSSK(d * 2, d * 4, dropout=dropout)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.context = nn.Sequential(
+            DilateAttention(d * 4, d * 4),
+            MSSK(d * 4, d * 4, dropout=dropout),
+            nn.Dropout2d(dropout)
+        )
+
+        self.dec3 = DecoderBlock(d * 4, d * 4, d * 2, dropout)
+        self.dec2 = DecoderBlock(d * 2, d * 2, d, dropout)
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(d, d, kernel_size=2, stride=2),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d, d, kernel_size=3, padding=1),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Dropout2d(dropout)
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(d, d // 2, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d // 2, 1, kernel_size=1)
+        )
+
+    def forward(self, x):
+        s0 = self.stem(x)           # H
+        s1 = self.enc1(s0)          # H
+        x = self.pool1(s1)          # H/2
+        s2 = self.enc2(x)           # H/2
+        x = self.pool2(s2)          # H/4
+        s3 = self.enc3(x)           # H/4
+        x = self.pool3(s3)          # H/8
+        x = self.context(x)         # H/8
+
+        x = self.dec3(x, s3)        # H/4
+        x = self.dec2(x, s2)        # H/2
+        x = self.dec1(x)            # H
+        if x.shape[-2:] != s1.shape[-2:]:
+            x = F.interpolate(x, size=s1.shape[-2:], mode='bilinear', align_corners=False)
+        x = x + s1
+        x = self.head(x)
+        return x
+
+
+# ================================================================
+# 5. 数据集与切分
+# ================================================================
+class CrackDatasetV5(Dataset):
+    def __init__(self, img_dir, mask_dir, keys, augment=False):
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.keys = list(keys)
+        self.augment = augment
+
+        all_img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+        all_mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+        self.img_map = {extract_key(f): f for f in all_img_files}
+        self.mask_map = {extract_key(f): f for f in all_mask_files}
+
+        missing_img = [k for k in self.keys if k not in self.img_map]
+        missing_mask = [k for k in self.keys if k not in self.mask_map]
+        if missing_img:
+            raise RuntimeError(f"以下 key 缺少图像文件: {missing_img[:10]}")
+        if missing_mask:
+            raise RuntimeError(f"以下 key 缺少掩码文件: {missing_mask[:10]}")
+
+    def __len__(self):
+        return len(self.keys)
+
+    def _normalize(self, img):
+        # 通道独立的稳健百分位归一化，降低单个异常波段极值对整块样本的影响
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(img.shape[0]):
+            band = img[c].astype(np.float32)
+            lo = np.percentile(band, 1.0)
+            hi = np.percentile(band, 99.0)
+            if hi - lo < 1e-6:
+                out[c] = np.zeros_like(band, dtype=np.float32)
+            else:
+                band = np.clip(band, lo, hi)
+                out[c] = (band - lo) / (hi - lo)
+        return out
+
+    def _augment(self, img, mask):
+        if random.random() < 0.5:
+            img = img[:, :, ::-1].copy()
+            mask = mask[:, ::-1].copy()
+        if random.random() < 0.5:
+            img = img[:, ::-1, :].copy()
+            mask = mask[::-1, :].copy()
+        if random.random() < 0.5:
+            k = random.choice([1, 2, 3])
+            img = np.rot90(img, k, axes=(1, 2)).copy()
+            mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+        if random.random() < CFG.band_noise_prob:
+            noise = np.random.normal(0.0, 0.015, size=img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
+
+        if random.random() < 0.35:
+            gain = np.random.uniform(0.92, 1.08, size=(img.shape[0], 1, 1)).astype(np.float32)
+            bias = np.random.uniform(-0.03, 0.03, size=(img.shape[0], 1, 1)).astype(np.float32)
+            img = np.clip(img * gain + bias, 0.0, 1.0)
+
+        if random.random() < CFG.band_drop_prob:
+            drop_count = 1 if img.shape[0] <= 7 else 2
+            drop_idx = np.random.choice(img.shape[0], drop_count, replace=False)
+            img[drop_idx] = 0.0
+
+        if random.random() < CFG.cutout_prob:
+            h, w = mask.shape
+            ch = min(CFG.cutout_size, h)
+            cw = min(CFG.cutout_size, w)
+            cy = np.random.randint(0, max(1, h - ch + 1))
+            cx = np.random.randint(0, max(1, w - cw + 1))
+            img[:, cy:cy + ch, cx:cx + cw] = 0.0
+
+        return img, mask
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        img_file = self.img_map[key]
+        mask_file = self.mask_map[key]
+
+        img = np.load(os.path.join(self.img_dir, img_file)).astype(np.float32)
+        mask = np.load(os.path.join(self.mask_dir, mask_file)).astype(np.float32)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+
+        img = self._normalize(img)
+        mask = (mask > 0.5).astype(np.float32)
+
+        if self.augment:
+            img, mask = self._augment(img, mask)
+
+        return torch.from_numpy(img), torch.from_numpy(mask), img_file
+
+
+def collect_valid_keys(img_dir, mask_dir):
+    img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+    mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+    img_map = {extract_key(f): f for f in img_files}
+    mask_map = {extract_key(f): f for f in mask_files}
+    mask_keys = set(mask_map.keys())
+    valid_keys = sorted([k for k in img_map.keys() if k in mask_keys])
+    if not valid_keys:
+        raise RuntimeError("没有找到匹配的 img / mask 数据对")
+    return valid_keys
+
+
+def grouped_train_val_split(keys, train_ratio=0.75, seed=42):
+    group_map = {}
+    for key in keys:
+        gid = extract_group_id(key)
+        group_map.setdefault(gid, []).append(key)
+
+    groups = sorted(group_map.keys())
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+
+    total = len(keys)
+    train_target = int(total * train_ratio)
+    train_keys, val_keys = [], []
+
+    for gid in groups:
+        current = group_map[gid]
+        if len(train_keys) < train_target:
+            train_keys.extend(current)
+        else:
+            val_keys.extend(current)
+
+    if len(val_keys) == 0:
+        val_keys = train_keys[-max(1, len(train_keys) // 5):]
+        train_keys = train_keys[:-len(val_keys)]
+
+    return sorted(train_keys), sorted(val_keys)
+
+
+# ================================================================
+# 6. 损失函数
+# ================================================================
+class PrecisionAwareSegLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('pos_weight_tensor', torch.tensor([CFG.pos_weight], dtype=torch.float32))
+
+    def forward(self, logits, target):
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+        probs = torch.sigmoid(logits)
+
+        target_smooth = target * (1.0 - CFG.label_smoothing) + 0.5 * CFG.label_smoothing
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            target_smooth,
+            pos_weight=self.pos_weight_tensor.to(logits.device)
+        )
+
+        dims = (0, 2, 3)
+        tp = (probs * target).sum(dims)
+        fp = (probs * (1.0 - target)).sum(dims)
+        fn = ((1.0 - probs) * target).sum(dims)
+        tversky = 1.0 - (tp + 1e-7) / (tp + CFG.tversky_alpha * fp + CFG.tversky_beta * fn + 1e-7)
+        tversky = tversky.mean()
+
+        p_t = probs * target + (1.0 - probs) * (1.0 - target)
+        focal = ((1.0 - p_t).pow(CFG.focal_gamma) * F.binary_cross_entropy_with_logits(
+            logits, target_smooth, reduction='none'
+        )).mean()
+
+        neg_probs = probs[target < 0.5]
+        if neg_probs.numel() > 0:
+            k = max(1, int(neg_probs.numel() * CFG.hard_negative_ratio))
+            hard_negative_penalty = torch.topk(neg_probs, k=k).values.mean()
+        else:
+            hard_negative_penalty = logits.new_tensor(0.0)
+
+        return (
+            CFG.bce_weight * bce +
+            CFG.tversky_weight * tversky +
+            CFG.focal_weight * focal +
+            CFG.hard_negative_weight * hard_negative_penalty
+        )
+
+
+# ================================================================
+# 7. 指标与阈值搜索
+# ================================================================
+@torch.no_grad()
+def collect_predictions(model, loader, device):
+    model.eval()
+    all_probs = []
+    all_masks = []
+    total_loss = 0.0
+    criterion = PrecisionAwareSegLoss().to(device)
+
+    for imgs, masks, _ in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            logits = model(imgs)
+            loss = criterion(logits, masks)
+        total_loss += loss.item()
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        masks_np = masks.detach().cpu().numpy()
+        all_probs.append(probs)
+        all_masks.append(masks_np)
+
+    if not all_probs:
+        return 0.0, np.zeros((0, 1, 1, 1), dtype=np.float32), np.zeros((0, 1, 1), dtype=np.float32)
+
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_masks = np.concatenate(all_masks, axis=0)
+    return total_loss / max(len(loader), 1), all_probs, all_masks
+
+
+def compute_binary_metrics_from_arrays(probs, masks, threshold):
+    pred = (probs > threshold).astype(np.uint8)
+    true = (masks > 0.5).astype(np.uint8)
+
+    tp = float(np.sum((pred == 1) & (true == 1)))
+    fp = float(np.sum((pred == 1) & (true == 0)))
+    fn = float(np.sum((pred == 0) & (true == 1)))
+    tn = float(np.sum((pred == 0) & (true == 0)))
+    eps = 1e-7
+
+    precision = (tp + eps) / (tp + fp + eps)
+    recall = (tp + eps) / (tp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    beta2 = 0.5 ** 2
+    f05 = (1.0 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+    iou = (tp + eps) / (tp + fp + fn + eps)
+    specificity = (tn + eps) / (tn + fp + eps)
+    accuracy = (tp + tn + eps) / (tp + fp + fn + tn + eps)
+    fpr = (fp + eps) / (fp + tn + eps)
+
+    return {
+        'Precision': precision,
+        'Recall': recall,
+        'F1': f1,
+        'F0.5': f05,
+        'IoU': iou,
+        'Specificity': specificity,
+        'Accuracy': accuracy,
+        'FPR': fpr,
+        'TP': tp,
+        'FP': fp,
+        'FN': fn,
+        'TN': tn,
+    }
+
+
+def choose_best_threshold(probs, masks):
+    best_thr = CFG.default_threshold
+    best_metrics = compute_binary_metrics_from_arrays(probs, masks, best_thr)
+    best_score = -1.0
+
+    thresholds = np.arange(CFG.threshold_min, CFG.threshold_max + 1e-9, CFG.threshold_step)
+    for thr in thresholds:
+        m = compute_binary_metrics_from_arrays(probs, masks, float(thr))
+        if m['Recall'] < CFG.min_recall_for_threshold:
+            continue
+
+        score = (
+            0.45 * m['F0.5'] +
+            0.30 * m['Precision'] +
+            0.20 * m['IoU'] +
+            0.05 * m['Specificity']
+        )
+        if score > best_score:
+            best_score = score
+            best_thr = float(thr)
+            best_metrics = m
+
+    return best_thr, best_metrics, best_score
+
+
+# ================================================================
+# 8. 可视化与日志
+# ================================================================
+class TrainingLogger:
+    def __init__(self, path):
+        self.path = path
+        self.h = {
+            'train_loss': [],
+            'val_loss': [],
+            'iou': [],
+            'f1': [],
+            'f05': [],
+            'precision': [],
+            'recall': [],
+            'specificity': [],
+            'fpr': [],
+            'lr': [],
+            'best_thr': [],
+            'score': []
+        }
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            for k in self.h:
+                if k in saved:
+                    self.h[k] = saved[k]
+
+    def log(self, train_loss, val_loss, metrics, lr, best_thr, score):
+        self.h['train_loss'].append(float(train_loss))
+        self.h['val_loss'].append(float(val_loss))
+        self.h['iou'].append(float(metrics['IoU']))
+        self.h['f1'].append(float(metrics['F1']))
+        self.h['f05'].append(float(metrics['F0.5']))
+        self.h['precision'].append(float(metrics['Precision']))
+        self.h['recall'].append(float(metrics['Recall']))
+        self.h['specificity'].append(float(metrics['Specificity']))
+        self.h['fpr'].append(float(metrics['FPR']))
+        self.h['lr'].append(float(lr))
+        self.h['best_thr'].append(float(best_thr))
+        self.h['score'].append(float(score))
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self.h, f, indent=2, ensure_ascii=False)
+
+    def plot(self, path):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+        axes[0, 0].plot(self.h['train_loss'], label='Train')
+        axes[0, 0].plot(self.h['val_loss'], label='Val')
+        axes[0, 0].set_title('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        axes[0, 1].plot(self.h['iou'], label='IoU')
+        axes[0, 1].plot(self.h['f1'], label='F1')
+        axes[0, 1].plot(self.h['f05'], label='F0.5')
+        axes[0, 1].set_title('Val Metrics')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        axes[0, 2].plot(self.h['precision'], label='Precision')
+        axes[0, 2].plot(self.h['recall'], label='Recall')
+        axes[0, 2].plot(self.h['specificity'], label='Specificity')
+        axes[0, 2].set_title('PR / Specificity')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+
+        axes[1, 0].plot(self.h['fpr'], label='FPR', color='purple')
+        axes[1, 0].set_title('False Positive Rate')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        axes[1, 1].plot(self.h['lr'], label='LR', color='red')
+        axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(True, alpha=0.3)
+
+        axes[1, 2].plot(self.h['best_thr'], label='Best Threshold', color='green')
+        axes[1, 2].plot(self.h['score'], label='Composite Score', color='black')
+        axes[1, 2].set_title('Threshold / Score')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+
+
+def save_prediction_figure(model, dataset, device, save_path, epoch, threshold):
+    model.eval()
+    count = min(CFG.viz_sample_count, len(dataset))
+    if count == 0:
+        return
+
+    fig, axes = plt.subplots(count, 4, figsize=(16, 4 * count))
+    if count == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    with torch.no_grad():
+        for i in range(count):
+            img, mask, name = dataset[i]
+            inp = img.unsqueeze(0).to(device)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(inp)
+            prob = torch.sigmoid(logits).squeeze().cpu().numpy()
+            pred = (prob > threshold).astype(np.float32)
+            band_idx = min(CFG.viz_band_idx, img.shape[0] - 1)
+
+            axes[i, 0].imshow(img[band_idx].numpy(), cmap='gray')
+            axes[i, 0].set_title(f'Input: {name}')
+            axes[i, 0].axis('off')
+
+            axes[i, 1].imshow(mask.numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[i, 1].set_title('Mask')
+            axes[i, 1].axis('off')
+
+            im = axes[i, 2].imshow(prob, cmap='jet', vmin=0, vmax=1)
+            axes[i, 2].set_title('Probability')
+            axes[i, 2].axis('off')
+            plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.04)
+
+            axes[i, 3].imshow(pred, cmap='gray', vmin=0, vmax=1)
+            axes[i, 3].set_title(f'Binary @ {threshold:.3f}')
+            axes[i, 3].axis('off')
+
+    plt.suptitle(f'Epoch {epoch}', fontsize=14)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
+
+
+# ================================================================
+# 9. 学习率调度
+# ================================================================
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, total_epochs, warmup_epochs, min_lr):
+        self.optimizer = optimizer
+        self.total_epochs = total_epochs
+        self.warmup_epochs = max(1, warmup_epochs)
+        self.min_lr = min_lr
+        self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self.last_epoch = 0
+
+    def step(self):
+        self.last_epoch += 1
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * self.last_epoch / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
+
+    def state_dict(self):
+        return {'last_epoch': self.last_epoch}
+
+    def load_state_dict(self, state_dict):
+        self.last_epoch = state_dict.get('last_epoch', 0)
+        # 恢复后立即同步一次当前 lr
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * max(1, self.last_epoch) / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
+
+
+# ================================================================
+# 10. 训练主流程
+# ================================================================
+def main():
+    set_seed(CFG.seed)
+    ensure_dirs()
+    save_config()
+
+    valid_keys = collect_valid_keys(IMG_DIR, MASK_DIR)
+    train_keys, val_keys = grouped_train_val_split(valid_keys, CFG.train_ratio, CFG.seed)
+
+    train_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, train_keys, augment=True)
+    val_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, val_keys, augment=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CFG.batch_size,
+        shuffle=True,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=len(train_ds) >= CFG.batch_size,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"设备: {device}")
+    print(f"数据根目录: {DATA_ROOT}")
+    print(f"训练样本: {len(train_ds)} | 验证样本: {len(val_ds)}")
+
+    train_groups = sorted({extract_group_id(k) for k in train_keys})
+    val_groups = sorted({extract_group_id(k) for k in val_keys})
+    print(f"训练分组数: {len(train_groups)} | 验证分组数: {len(val_groups)}")
+
+    model = CrackSeg7BandV5(
+        in_channels=CFG.in_channels,
+        base_dim=CFG.base_dim,
+        dropout=CFG.dropout
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {total_params:,}")
+
+    criterion = PrecisionAwareSegLoss().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    scheduler = WarmupCosineScheduler(optimizer, CFG.epochs, CFG.warmup_epochs, CFG.min_lr)
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    ema = EMA(model, decay=CFG.ema_decay)
+    logger = TrainingLogger(TRAIN_LOG)
+
+    start_epoch = 0
+    best_score = -1.0
+    best_threshold = CFG.default_threshold
+    best_metrics = None
+    patience_counter = 0
+
+    if os.path.exists(LATEST_CHECKPOINT):
+        print(f"发现断点文件，恢复训练: {LATEST_CHECKPOINT}")
+        ckpt = torch.load(LATEST_CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        scaler.load_state_dict(ckpt['scaler_state_dict'])
+        ema.shadow = {k: v.to(device) for k, v in ckpt['ema_shadow'].items()}
+        start_epoch = ckpt['epoch']
+        best_score = ckpt.get('best_score', -1.0)
+        best_threshold = ckpt.get('best_threshold', CFG.default_threshold)
+        best_metrics = ckpt.get('best_metrics', None)
+        patience_counter = ckpt.get('patience_counter', 0)
+
+    print("=" * 68)
+    print("7 波段训练 v5：Precision 优先 + 分组验证 + 快速收敛")
+    print(f"epochs={CFG.epochs}, batch={CFG.batch_size}, lr={CFG.lr}, min_lr={CFG.min_lr}")
+    print(f"pos_weight={CFG.pos_weight}, tversky_alpha={CFG.tversky_alpha}, tversky_beta={CFG.tversky_beta}")
+    print(f"hard_negative_ratio={CFG.hard_negative_ratio}, patience={CFG.patience}")
+    print("=" * 68)
+
+    for epoch in range(start_epoch, CFG.epochs):
+        ep = epoch + 1
+        model.train()
+        running_loss = 0.0
+        batch_count = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {ep:03d}", dynamic_ncols=True)
+        for imgs, masks, _ in pbar:
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            if CFG.mixup_alpha > 0.0 and random.random() < 0.25:
+                imgs, masks = beta_mixup(imgs, masks, CFG.mixup_alpha, device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(imgs)
+                loss = criterion(logits, masks)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            ema.update()
+
+            running_loss += loss.item()
+            batch_count += 1
+            pbar.set_postfix(loss=f"{running_loss / batch_count:.4f}")
+
+        scheduler.step()
+
+        if batch_count == 0:
+            continue
+
+        ema.apply_shadow()
+        val_loss, val_probs, val_masks = collect_predictions(model, val_loader, device)
+        threshold, metrics, score = choose_best_threshold(val_probs, val_masks)
+        ema.restore()
+
+        train_loss = running_loss / batch_count
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.log(train_loss, val_loss, metrics, current_lr, threshold, score)
+
+        improved = score > best_score
+        if improved:
+            best_score = score
+            best_threshold = threshold
+            best_metrics = copy.deepcopy(metrics)
+            patience_counter = 0
+            ema.apply_shadow()
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'best_threshold': best_threshold,
+                'best_metrics': best_metrics,
+                'config': asdict(CFG),
+            }, CHECKPOINT)
+            ema.restore()
+            tag = ' >>> Best Score!'
+        else:
+            patience_counter += 1
+            tag = f' Wait({patience_counter}/{CFG.patience})'
+
+        torch.save({
+            'epoch': ep,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'ema_shadow': ema.shadow,
+            'best_score': best_score,
+            'best_threshold': best_threshold,
+            'best_metrics': best_metrics,
+            'patience_counter': patience_counter,
+        }, LATEST_CHECKPOINT)
+
+        print(
+            f"Ep{ep:03d} | Tr:{train_loss:.4f} Va:{val_loss:.4f} | "
+            f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} F0.5:{metrics['F0.5']:.4f} | "
+            f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} Spec:{metrics['Specificity']:.4f} | "
+            f"FPR:{metrics['FPR']:.4f} Thr:{threshold:.3f} Score:{score:.4f} LR:{current_lr:.2e}{tag}"
+        )
+
+        if ep % CFG.viz_every == 0:
+            ema.apply_shadow()
+            save_prediction_figure(
+                model,
+                val_ds,
+                device,
+                os.path.join(OUTPUT_ROOT, f"viz_ep{ep:03d}.png"),
+                ep,
+                threshold
+            )
+            ema.restore()
+
+        if patience_counter >= CFG.patience:
+            print(f"早停触发：连续 {CFG.patience} 个 epoch 综合得分未提升。")
+            break
+
+    logger.plot(os.path.join(OUTPUT_ROOT, "training_curves_7band_v5.png"))
+    print("=" * 68)
+    print("训练完成")
+    print(f"最佳综合分数: {best_score:.4f}")
+    print(f"最佳阈值: {best_threshold:.3f}")
+    if best_metrics is not None:
+        print(
+            f"最佳指标 => IoU:{best_metrics['IoU']:.4f}, F1:{best_metrics['F1']:.4f}, "
+            f"F0.5:{best_metrics['F0.5']:.4f}, Precision:{best_metrics['Precision']:.4f}, "
+            f"Recall:{best_metrics['Recall']:.4f}, Specificity:{best_metrics['Specificity']:.4f}"
+        )
+    print(f"最佳模型: {CHECKPOINT}")
+    print(f"断点文件: {LATEST_CHECKPOINT}")
+    print(f"配置文件: {CONFIG_PATH}")
+    print("=" * 68)
+
+
+if __name__ == '__main__':
+    main()
