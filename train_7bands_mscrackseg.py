@@ -1,100 +1,133 @@
 #!/usr/bin/env python3
 """
-Generalization-oriented 7-band MS-CrackSeg training script.
+MS-CrackSeg 7 波段训练脚本 v5
+=================================
 
-This version fixes the main causes of optimistic validation metrics:
-1. strict image/mask pairing by spatial key;
-2. spatial-block validation split instead of random patch split;
-3. train-set per-band normalization applied to train/val/test;
-4. lower model capacity and stronger regularization;
-5. model selection at fixed threshold, with threshold search only after training;
-6. optional final evaluation on testimg/testmasknpy.
+适用场景：
+1. 输入是 7 个筛选后的高光谱波段 `.npy` 数组。
+2. 任务是混凝土裂缝二分类分割。
+3. 需要在 AutoDL / RTX3090 环境中稳定训练。
+
+本脚本提供：
+1. 自动匹配 [`reduction_band/7selectband/img`](reduction_band/7selectband/img) 与
+   [`reduction_band/7selectband/masknpy`](reduction_band/7selectband/masknpy) 中命名略有不同的文件。
+2. 每个 epoch 保存 train loss、val loss、IoU、F1、Precision、Recall、LR 到 JSON。
+3. 自动保存最佳模型 [`7band_best_model.pth`](reduction_band/7bandtrain5.py:121) 与最新断点，支持断点续训。
+4. 自动绘制训练曲线，便于观察是否过拟合。
+5. 在模型选择时兼顾 Precision / Recall 平衡，而不是只盯 IoU。
 """
 
+import os
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+
+import copy
 import json
 import math
-import os
 import random
 import re
-from pathlib import Path
-
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
+from dataclasses import dataclass, asdict
 
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
-# Paths
-DEFAULT_DATA = Path(os.environ.get("CRACK_DATA_DIR", "/root/autodl-tmp/reduction_band/7selectband"))
-TRAIN_IMG_DIR = DEFAULT_DATA / "img"
-TRAIN_MASK_DIR = DEFAULT_DATA / "masknpy"
-TEST_IMG_DIR = DEFAULT_DATA / "testimg"
-TEST_MASK_DIR = DEFAULT_DATA / "testmasknpy"
+# ================================================================
+# 1. 配置
+# ================================================================
+@dataclass
+class Config:
+    # 数据路径：优先使用当前工程相对路径，若不存在则回退到 Linux 路径
+    workspace_data_root: str = os.path.join("reduction_band", "7selectband")
+    linux_data_root: str = r"/root/autodl-tmp/reduction_band/7selectband"
 
-OUTPUT_ROOT = Path(
-    os.environ.get("CRACK_OUTPUT_DIR", "/root/autodl-tmp/reduction_band/output_results_7band/output4_generalized")
-)
-MODEL_DIR = OUTPUT_ROOT / "models"
-CHECKPOINT = MODEL_DIR / "7band_best_model.pth"
-LATEST_CHECKPOINT = MODEL_DIR / "latest_checkpoint.pth"
-TRAIN_LOG = OUTPUT_ROOT / "training_log_7band_generalized.json"
-FINAL_METRICS = OUTPUT_ROOT / "final_metrics_7band_generalized.json"
+    output_root_win: str = os.path.join("reduction_band", "output_results_7band", "output5")
+    output_root_linux: str = r"/root/autodl-tmp/reduction_band/output_results_7band/output5"
 
+    in_channels: int = 7
+    epochs: int = 180
+    batch_size: int = 12
+    lr: float = 2.5e-4
+    min_lr: float = 8e-7
+    warmup_epochs: int = 8
+    weight_decay: float = 1e-4
+    patience: int = 24
+    num_workers: int = 0
+    grad_clip: float = 1.0
+    seed: int = 42
 
-# Training hyperparameters
-IN_CHANNELS = 7
-EPOCHS = 300
-BATCH_SIZE = 16
-LEARNING_RATE = 2.0e-4
-WEIGHT_DECAY = 1.0e-3
-PATIENCE = 30
-NUM_WORKERS = 0
-SEED = 42
-GRAD_CLIP = 1.0
-PRED_THRESHOLD = 0.5
-MIN_DELTA = 1.0e-4
-VAL_RATIO = 0.2
-SPATIAL_GROUP_SIZE = 4
-RESUME_TRAINING = False
+    train_ratio: float = 0.75
+    val_ratio_within_trainval: float = 0.20
+    base_dim: int = 32
+    dropout: float = 0.18
+    ema_decay: float = 0.998
 
+    # 旧版本正样本惩罚过强，导致 recall 高、precision 低
+    pos_weight: float = 2.2
+    bce_weight: float = 0.24
+    tversky_weight: float = 0.36
+    focal_weight: float = 0.18
+    hard_negative_weight: float = 0.12
+    background_weight: float = 0.10
+    focal_gamma: float = 2.0
+    tversky_alpha: float = 0.62   # 保持对 FP 的惩罚，但不过度压制召回
+    tversky_beta: float = 0.38
+    label_smoothing: float = 0.01
+    hard_negative_ratio: float = 0.05
+    empty_mask_loss_scale: float = 1.20
 
-# Loss and regularization
-POS_WEIGHT = 4.0
-AUTO_POS_WEIGHT = True
-MAX_POS_WEIGHT = 6.0
-DICE_WEIGHT = 0.65
-BCE_WEIGHT = 0.25
-FOCAL_WEIGHT = 0.10
-FOCAL_GAMMA = 2.0
-LABEL_SMOOTHING = 0.02
+    mixup_alpha: float = 0.0      # 分割任务中对细裂缝会模糊边界，默认关闭
+    band_drop_prob: float = 0.15
+    band_noise_prob: float = 0.25
+    cutout_prob: float = 0.25
+    cutout_size: int = 20
 
-BASE_DIM = 16
-DROPOUT = 0.35
-MIXUP_ALPHA = 0.10
-BAND_DROP_PROB = 0.20
-EMA_DECAY = 0.995
+    threshold_candidates: tuple = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
+    min_precision_floor: float = 0.55
+    default_threshold: float = 0.55
 
-
-# Visualization
-VIZ_BAND_IDX = 3
-VIZ_EVERY = 20
-VIZ_SAMPLE_INDICES = [0, 1, 2]
-BAND_NAMES = ["397.5nm", "456.4nm", "532.7nm", "577.8nm", "903.9nm", "935.1nm", "942.0nm"]
-
-KEY_PATTERN = re.compile(r"(r\d+c\d+col\d+row\d+overlap\d+)", re.IGNORECASE)
-SPATIAL_PATTERN = re.compile(r"r(\d+)c(\d+)col(\d+)row(\d+)overlap(\d+)", re.IGNORECASE)
+    viz_every: int = 0
+    viz_band_idx: int = 3
+    viz_sample_count: int = 3
 
 
-def set_seed(seed=SEED):
+CFG = Config()
+
+
+def resolve_data_root():
+    if os.path.isdir(CFG.workspace_data_root):
+        return CFG.workspace_data_root
+    return CFG.linux_data_root
+
+
+def resolve_output_root():
+    if os.name == 'nt':
+        return CFG.output_root_win
+    return CFG.output_root_linux
+
+
+DATA_ROOT = resolve_data_root()
+IMG_DIR = os.path.join(DATA_ROOT, "img")
+MASK_DIR = os.path.join(DATA_ROOT, "masknpy")
+OUTPUT_ROOT = resolve_output_root()
+MODEL_DIR = os.path.join(OUTPUT_ROOT, "models")
+TRAIN_LOG = os.path.join(OUTPUT_ROOT, "training_metrics_7band.json")
+CONFIG_PATH = os.path.join(OUTPUT_ROOT, "training_config_7band_v5.json")
+CHECKPOINT = os.path.join(MODEL_DIR, "7band_best_model.pth")
+LATEST_CHECKPOINT = os.path.join(MODEL_DIR, "latest_checkpoint_7band.pth")
+
+
+# ================================================================
+# 2. 基础工具
+# ================================================================
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -103,803 +136,929 @@ def set_seed(seed=SEED):
     torch.backends.cudnn.benchmark = False
 
 
-def seed_worker(worker_id):
-    worker_seed = (torch.initial_seed() + worker_id) % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def ensure_dirs():
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_ROOT / "viz").mkdir(parents=True, exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
 
-def extract_key(filename):
-    match = KEY_PATTERN.search(Path(filename).stem)
-    if match is None:
-        raise ValueError(f"Cannot extract spatial key from filename: {filename}")
-    return match.group(1).lower()
+def save_config():
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(asdict(CFG), f, indent=2, ensure_ascii=False)
 
 
-def read_image(path):
-    img = np.load(path).astype(np.float32, copy=False)
-    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
-    if img.ndim == 4 and 1 in img.shape:
-        img = np.squeeze(img)
-    if img.ndim != 3:
-        raise ValueError(f"Image must be 3D, got {img.shape}: {path}")
-    if img.shape[0] == IN_CHANNELS:
-        return np.ascontiguousarray(img, dtype=np.float32)
-    if img.shape[-1] == IN_CHANNELS:
-        return np.ascontiguousarray(np.transpose(img, (2, 0, 1)), dtype=np.float32)
-    raise ValueError(f"Image must have {IN_CHANNELS} bands, got {img.shape}: {path}")
+def extract_key(filename: str) -> str:
+    stem = filename.replace('.npy', '')
+    m = re.search(r'r\dc\d+col\d+row\d+', stem)
+    if m:
+        return m.group()
+    m = re.search(r'col\d+row\d+', stem)
+    if m:
+        return m.group()
+    return stem
 
 
-def read_mask(path):
-    mask = np.load(path)
-    mask = np.squeeze(mask)
-    if mask.ndim != 2:
-        raise ValueError(f"Mask must be 2D after squeeze, got {mask.shape}: {path}")
-    return np.ascontiguousarray((mask > 0).astype(np.float32))
+def extract_group_id(key: str) -> str:
+    """
+    用于按场景分组切分，减少相邻切块同时落入训练/验证集导致的指标泄漏。
+    优先提取 r?c? 作为分组；若无法提取，再退化为去除 row/col 细粒度位置。
+    """
+    m = re.search(r'(r\dc\d+)', key)
+    if m:
+        return m.group(1)
+    key2 = re.sub(r'col\d+', 'colX', key)
+    key2 = re.sub(r'row\d+', 'rowY', key2)
+    return key2
 
 
-def pair_files(img_dir, mask_dir):
-    img_dir = Path(img_dir)
-    mask_dir = Path(mask_dir)
-    if not img_dir.is_dir():
-        raise FileNotFoundError(f"Image directory not found: {img_dir}")
-    if not mask_dir.is_dir():
-        raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
-
-    images = sorted(img_dir.glob("*.npy"))
-    masks = sorted(mask_dir.glob("*.npy"))
-    if not images:
-        raise RuntimeError(f"No .npy images found in {img_dir}")
-    if not masks:
-        raise RuntimeError(f"No .npy masks found in {mask_dir}")
-
-    image_by_key = {}
-    mask_by_key = {}
-    for path in images:
-        key = extract_key(path.name)
-        if key in image_by_key:
-            raise RuntimeError(f"Duplicate image key {key}: {image_by_key[key].name}, {path.name}")
-        image_by_key[key] = path
-    for path in masks:
-        key = extract_key(path.name)
-        if key in mask_by_key:
-            raise RuntimeError(f"Duplicate mask key {key}: {mask_by_key[key].name}, {path.name}")
-        mask_by_key[key] = path
-
-    missing_masks = sorted(set(image_by_key) - set(mask_by_key))
-    missing_images = sorted(set(mask_by_key) - set(image_by_key))
-    if missing_masks or missing_images:
-        raise RuntimeError(
-            f"Pairing failed: missing_masks={missing_masks[:5]}, missing_images={missing_images[:5]}"
-        )
-
-    return [(key, image_by_key[key], mask_by_key[key]) for key in sorted(image_by_key)]
+def beta_mixup(imgs, masks, alpha, device):
+    if alpha <= 0 or imgs.size(0) < 2:
+        return imgs, masks
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(imgs.size(0), device=device)
+    mixed_imgs = lam * imgs + (1.0 - lam) * imgs[perm]
+    mixed_masks = lam * masks + (1.0 - lam) * masks[perm]
+    return mixed_imgs, mixed_masks
 
 
-def spatial_group(key):
-    match = SPATIAL_PATTERN.search(key)
-    if match is None:
-        return key
-    r, c, col, row, _ = [int(v) for v in match.groups()]
-    return (r, c, col // SPATIAL_GROUP_SIZE, row // SPATIAL_GROUP_SIZE)
+def compute_balance_score(metrics):
+    """
+    模型保存分数：
+    - IoU / F1 仍然重要；
+    - Precision / Recall 都参与；
+    - 额外惩罚 Precision 与 Recall 差距过大，避免一高一低。
+    """
+    precision = float(metrics['Precision'])
+    recall = float(metrics['Recall'])
+    f1 = float(metrics['F1'])
+    iou = float(metrics['IoU'])
+    balance_penalty = abs(precision - recall)
+    score = 0.40 * iou + 0.30 * f1 + 0.15 * precision + 0.15 * recall - 0.10 * balance_penalty
+    return score
 
 
-def grouped_split(pairs, val_ratio=VAL_RATIO, seed=SEED):
-    groups = {}
-    for idx, (key, _, _) in enumerate(pairs):
-        groups.setdefault(spatial_group(key), []).append(idx)
-
-    group_items = list(groups.items())
-    rng = random.Random(seed)
-    rng.shuffle(group_items)
-
-    target_val = max(1, int(round(len(pairs) * val_ratio)))
-    val_indices = []
-    train_indices = []
-    for _, indices in group_items:
-        if len(val_indices) < target_val:
-            val_indices.extend(indices)
-        else:
-            train_indices.extend(indices)
-
-    if not train_indices or not val_indices:
-        indices = list(range(len(pairs)))
-        rng.shuffle(indices)
-        val_count = max(1, int(round(len(indices) * val_ratio)))
-        val_indices = indices[:val_count]
-        train_indices = indices[val_count:]
-
-    return sorted(train_indices), sorted(val_indices)
-
-
-def compute_band_stats(pairs, indices):
-    sums = np.zeros(IN_CHANNELS, dtype=np.float64)
-    sq_sums = np.zeros(IN_CHANNELS, dtype=np.float64)
-    count = 0
-    for idx in tqdm(indices, desc="Computing band mean/std", leave=False):
-        img = read_image(pairs[idx][1])
-        flat = img.reshape(IN_CHANNELS, -1).astype(np.float64)
-        sums += flat.sum(axis=1)
-        sq_sums += (flat * flat).sum(axis=1)
-        count += flat.shape[1]
-    mean = sums / max(count, 1)
-    var = sq_sums / max(count, 1) - mean * mean
-    std = np.sqrt(np.maximum(var, 1.0e-8))
-    return mean.astype(np.float32), std.astype(np.float32)
-
-
-def compute_pos_weight(pairs, indices):
-    positives = 0.0
-    total = 0.0
-    for idx in tqdm(indices, desc="Computing pos_weight", leave=False):
-        mask = read_mask(pairs[idx][2])
-        positives += float(mask.sum())
-        total += float(mask.size)
-    negatives = max(total - positives, 1.0)
-    positives = max(positives, 1.0)
-    return float(np.clip(negatives / positives, 1.0, MAX_POS_WEIGHT))
-
-
-class CrackDataset(Dataset):
-    def __init__(self, pairs, augment=False, band_mean=None, band_std=None):
-        self.pairs = list(pairs)
-        self.augment = augment
-        self.band_mean = None if band_mean is None else np.asarray(band_mean, dtype=np.float32).reshape(-1, 1, 1)
-        self.band_std = None if band_std is None else np.asarray(band_std, dtype=np.float32).reshape(-1, 1, 1)
-        if not self.pairs:
-            raise RuntimeError("Dataset is empty")
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def set_normalization(self, band_mean, band_std):
-        self.band_mean = np.asarray(band_mean, dtype=np.float32).reshape(-1, 1, 1)
-        self.band_std = np.asarray(band_std, dtype=np.float32).reshape(-1, 1, 1)
-
-    def _normalize(self, img):
-        if self.band_mean is None or self.band_std is None:
-            lo = np.percentile(img, 1, axis=(1, 2), keepdims=True)
-            hi = np.percentile(img, 99, axis=(1, 2), keepdims=True)
-            return np.clip((img - lo) / np.maximum(hi - lo, 1.0e-6), 0.0, 1.0)
-        img = (img - self.band_mean) / np.maximum(self.band_std, 1.0e-6)
-        return np.clip(img, -5.0, 5.0)
-
-    def __getitem__(self, idx):
-        key, img_path, mask_path = self.pairs[idx]
-        img = read_image(img_path)
-        mask = read_mask(mask_path)
-
-        if img.shape[1:] != mask.shape:
-            raise ValueError(f"Spatial mismatch for {key}: image={img.shape}, mask={mask.shape}")
-
-        if self.augment:
-            if random.random() < 0.5:
-                img = img[:, :, ::-1].copy()
-                mask = mask[:, ::-1].copy()
-            if random.random() < 0.5:
-                img = img[:, ::-1, :].copy()
-                mask = mask[::-1, :].copy()
-            if random.random() < 0.5:
-                k = random.choice([1, 2, 3])
-                img = np.rot90(img, k, axes=(1, 2)).copy()
-                mask = np.rot90(mask, k, axes=(0, 1)).copy()
-            if random.random() < 0.35:
-                img = img * np.random.uniform(0.85, 1.15)
-            if random.random() < 0.35:
-                scale = np.random.uniform(0.90, 1.10, (img.shape[0], 1, 1)).astype(np.float32)
-                img = img * scale
-
-        img = self._normalize(img)
-
-        if self.augment:
-            if random.random() < 0.25:
-                img = img + np.random.normal(0.0, 0.03, img.shape).astype(np.float32)
-            if random.random() < BAND_DROP_PROB:
-                drop_idx = np.random.choice(img.shape[0], 1, replace=False)
-                img = img.copy()
-                img[drop_idx] = 0.0
-
-        return torch.from_numpy(img.astype(np.float32)), torch.from_numpy(mask.astype(np.float32)), key
-
-
+# ================================================================
+# 3. EMA
+# ================================================================
 class EMA:
-    def __init__(self, model, decay=EMA_DECAY):
+    def __init__(self, model: nn.Module, decay: float):
         self.model = model
         self.decay = decay
         self.shadow = {}
         self.backup = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.detach().clone()
+                self.shadow[name] = param.data.clone()
 
     def update(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.detach()
+                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
 
     def apply_shadow(self):
-        self.backup = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+                param.data = self.shadow[name].clone()
 
     def restore(self):
         for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
+            if param.requires_grad:
+                param.data = self.backup[name]
         self.backup = {}
 
 
-def group_norm(channels):
-    groups = 8
-    while channels % groups != 0:
-        groups -= 1
-    return nn.GroupNorm(groups, channels)
-
-
+# ================================================================
+# 4. 模型定义
+# ================================================================
 class MSSK(nn.Module):
-    def __init__(self, in_channels, out_channels=None, dropout=DROPOUT):
+    def __init__(self, in_channels, out_channels=None, dropout=0.18):
         super().__init__()
-        if out_channels is None:
-            out_channels = in_channels
-        n = out_channels // 4
-        self.conv1x1 = nn.Conv2d(in_channels, n, kernel_size=1)
-        self.conv3x3 = nn.Conv2d(in_channels, n, kernel_size=3, padding=1)
-        self.conv5x5 = nn.Conv2d(in_channels, n, kernel_size=5, padding=2)
-        self.conv7x7 = nn.Conv2d(in_channels, n, kernel_size=7, padding=3)
-        self.fusion = nn.Conv2d(n * 4, out_channels, kernel_size=1)
-        self.norm = group_norm(out_channels)
+        out_channels = out_channels or in_channels
+        branch = max(out_channels // 4, 8)
+        self.conv1x1 = nn.Conv2d(in_channels, branch, kernel_size=1)
+        self.conv3x3 = nn.Conv2d(in_channels, branch, kernel_size=3, padding=1)
+        self.conv5x5 = nn.Conv2d(in_channels, branch, kernel_size=5, padding=2)
+        self.conv7x7 = nn.Conv2d(in_channels, branch, kernel_size=7, padding=3)
+        self.fusion = nn.Conv2d(branch * 4, out_channels, kernel_size=1)
+        self.norm = nn.GroupNorm(8, out_channels)
         self.dropout = nn.Dropout2d(dropout)
-        self.relu = nn.ReLU(inplace=True)
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
         residual = self.shortcut(x)
-        out = torch.cat([self.conv1x1(x), self.conv3x3(x), self.conv5x5(x), self.conv7x7(x)], dim=1)
-        out = self.dropout(self.norm(self.fusion(out)))
-        return self.relu(out + residual)
+        out = torch.cat([
+            self.conv1x1(x),
+            self.conv3x3(x),
+            self.conv5x5(x),
+            self.conv7x7(x)
+        ], dim=1)
+        out = self.fusion(out)
+        out = self.norm(out)
+        out = self.dropout(out)
+        out = self.act(out + residual)
+        return out
 
 
 class DilateAttention(nn.Module):
     def __init__(self, in_channel, depth):
         super().__init__()
-        self.group_norm = group_norm(in_channel)
+        self.norm = nn.GroupNorm(8, in_channel)
         self.relu = nn.ReLU(inplace=True)
-        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1)
-        self.atrous_block2 = nn.Conv2d(in_channel, depth, 3, padding=2, dilation=2)
-        self.atrous_block3 = nn.Conv2d(in_channel, depth, 3, padding=4, dilation=4)
-        self.softmax = nn.Softmax(dim=1)
+        self.v = nn.Conv2d(in_channel, depth, 1, 1)
+        self.q = nn.Conv2d(in_channel, depth, 3, 1, padding=2, dilation=2)
+        self.k = nn.Conv2d(in_channel, depth, 3, 1, padding=4, dilation=4)
+        self.out = nn.Conv2d(depth, depth, kernel_size=1)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(depth, depth, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        v = self.atrous_block1(x)
-        q = self.atrous_block2(x)
-        k = self.atrous_block3(x)
-        return v * self.softmax(k * q) + self.relu(self.group_norm(x))
+        v = self.v(x)
+        attn = torch.softmax(self.q(x) * self.k(x), dim=1)
+        out = v * attn
+        out = self.out(out)
+        out = out * self.gate(out)
+        out = out + self.relu(self.norm(x))
+        return out
 
 
-class CrackSeg7Band(nn.Module):
-    def __init__(self, in_channels=7, classnum=1, base_dim=BASE_DIM, dropout=DROPOUT):
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.fuse = MSSK(out_channels + skip_channels, out_channels, dropout=dropout)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.fuse(x)
+
+
+class CrackSeg7BandV5(nn.Module):
+    def __init__(self, in_channels=7, base_dim=32, dropout=0.18):
         super().__init__()
         d = base_dim
-        self.relu = nn.ReLU(inplace=True)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+        )
 
-        self.enc_conv1 = nn.Conv2d(in_channels, d, kernel_size=7, padding=3)
-        self.enc_gn1 = group_norm(d)
+        self.enc1 = MSSK(d, d, dropout=dropout)
         self.pool1 = nn.MaxPool2d(2)
-        self.da1 = DilateAttention(d, d)
-        self.drop1 = nn.Dropout2d(dropout)
-
-        self.enc_conv2 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.enc_gn2 = group_norm(d)
+        self.enc2 = MSSK(d, d * 2, dropout=dropout)
         self.pool2 = nn.MaxPool2d(2)
-        self.da2 = DilateAttention(d, d)
-        self.drop2 = nn.Dropout2d(dropout)
-
-        self.enc_conv3 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.enc_gn3 = group_norm(d)
+        self.enc3 = MSSK(d * 2, d * 4, dropout=dropout)
         self.pool3 = nn.MaxPool2d(2)
-        self.da3 = DilateAttention(d, d)
-        self.drop3 = nn.Dropout2d(dropout)
 
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(d, d, kernel_size=7, padding=3),
-            group_norm(d),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
+        self.context = nn.Sequential(
+            DilateAttention(d * 4, d * 4),
+            MSSK(d * 4, d * 4, dropout=dropout),
+            nn.Dropout2d(dropout)
         )
 
-        self.up3 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.mssk1 = MSSK(d * 2, d, dropout)
-        self.up2 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.mssk2 = MSSK(d * 2, d, dropout)
-        self.up1 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.dec_conv1 = nn.Sequential(
+        self.dec3 = DecoderBlock(d * 4, d * 4, d * 2, dropout)
+        self.dec2 = DecoderBlock(d * 2, d * 2, d, dropout)
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(d, d, kernel_size=2, stride=2),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
             nn.Conv2d(d, d, kernel_size=3, padding=1),
-            group_norm(d),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Dropout2d(dropout)
         )
-        self.final = nn.Conv2d(d, classnum, kernel_size=1)
+
+        self.head = nn.Sequential(
+            nn.Conv2d(d, d // 2, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d // 2, 1, kernel_size=1)
+        )
 
     def forward(self, x):
-        e1 = self.relu(self.enc_gn1(self.enc_conv1(x)))
-        e1 = self.drop1(self.da1(self.pool1(e1)))
+        s0 = self.stem(x)           # H
+        s1 = self.enc1(s0)          # H
+        x = self.pool1(s1)          # H/2
+        s2 = self.enc2(x)           # H/2
+        x = self.pool2(s2)          # H/4
+        s3 = self.enc3(x)           # H/4
+        x = self.pool3(s3)          # H/8
+        x = self.context(x)         # H/8
 
-        e2 = self.relu(self.enc_gn2(self.enc_conv2(e1)))
-        e2 = self.drop2(self.da2(self.pool2(e2)))
-
-        e3 = self.relu(self.enc_gn3(self.enc_conv3(e2)))
-        e3 = self.drop3(self.da3(self.pool3(e3)))
-
-        b = self.bottleneck(e3)
-        d3 = self.mssk1(torch.cat([self.up3(b), e2], dim=1))
-        d2 = self.mssk2(torch.cat([self.up2(d3), e1], dim=1))
-        d1 = self.dec_conv1(self.up1(d2))
-        return self.final(d1)
+        x = self.dec3(x, s3)        # H/4
+        x = self.dec2(x, s2)        # H/2
+        x = self.dec1(x)            # H
+        if x.shape[-2:] != s1.shape[-2:]:
+            x = F.interpolate(x, size=s1.shape[-2:], mode='bilinear', align_corners=False)
+        x = x + s1
+        x = self.head(x)
+        return x
 
 
-class DiceBCEFocalLoss(nn.Module):
-    def __init__(self, pos_weight=POS_WEIGHT):
+# ================================================================
+# 5. 数据集与切分
+# ================================================================
+class CrackDatasetV5(Dataset):
+    def __init__(self, img_dir, mask_dir, keys, augment=False):
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.keys = list(keys)
+        self.augment = augment
+
+        all_img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+        all_mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+        self.img_map = {extract_key(f): f for f in all_img_files}
+        self.mask_map = {extract_key(f): f for f in all_mask_files}
+
+        missing_img = [k for k in self.keys if k not in self.img_map]
+        missing_mask = [k for k in self.keys if k not in self.mask_map]
+        if missing_img:
+            raise RuntimeError(f"以下 key 缺少图像文件: {missing_img[:10]}")
+        if missing_mask:
+            raise RuntimeError(f"以下 key 缺少掩码文件: {missing_mask[:10]}")
+
+    def __len__(self):
+        return len(self.keys)
+
+    def _normalize(self, img):
+        # 通道独立的稳健百分位归一化，降低单个异常波段极值对整块样本的影响
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(img.shape[0]):
+            band = img[c].astype(np.float32)
+            lo = np.percentile(band, 1.0)
+            hi = np.percentile(band, 99.0)
+            if hi - lo < 1e-6:
+                out[c] = np.zeros_like(band, dtype=np.float32)
+            else:
+                band = np.clip(band, lo, hi)
+                out[c] = (band - lo) / (hi - lo)
+        return out
+
+    def _augment(self, img, mask):
+        if random.random() < 0.5:
+            img = img[:, :, ::-1].copy()
+            mask = mask[:, ::-1].copy()
+        if random.random() < 0.5:
+            img = img[:, ::-1, :].copy()
+            mask = mask[::-1, :].copy()
+        if random.random() < 0.5:
+            k = random.choice([1, 2, 3])
+            img = np.rot90(img, k, axes=(1, 2)).copy()
+            mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+        if random.random() < CFG.band_noise_prob:
+            noise = np.random.normal(0.0, 0.015, size=img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
+
+        if random.random() < 0.35:
+            gain = np.random.uniform(0.92, 1.08, size=(img.shape[0], 1, 1)).astype(np.float32)
+            bias = np.random.uniform(-0.03, 0.03, size=(img.shape[0], 1, 1)).astype(np.float32)
+            img = np.clip(img * gain + bias, 0.0, 1.0)
+
+        if random.random() < CFG.band_drop_prob:
+            drop_count = 1 if img.shape[0] <= 7 else 2
+            drop_idx = np.random.choice(img.shape[0], drop_count, replace=False)
+            img[drop_idx] = 0.0
+
+        if random.random() < CFG.cutout_prob:
+            h, w = mask.shape
+            ch = min(CFG.cutout_size, h)
+            cw = min(CFG.cutout_size, w)
+            cy = np.random.randint(0, max(1, h - ch + 1))
+            cx = np.random.randint(0, max(1, w - cw + 1))
+            img[:, cy:cy + ch, cx:cx + cw] = 0.0
+
+        return img, mask
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        img_file = self.img_map[key]
+        mask_file = self.mask_map[key]
+
+        img = np.load(os.path.join(self.img_dir, img_file)).astype(np.float32)
+        mask = np.load(os.path.join(self.mask_dir, mask_file)).astype(np.float32)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+
+        img = self._normalize(img)
+        mask = (mask > 0.5).astype(np.float32)
+
+        if self.augment:
+            img, mask = self._augment(img, mask)
+
+        return torch.from_numpy(img), torch.from_numpy(mask), img_file
+
+
+def collect_valid_keys(img_dir, mask_dir):
+    img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+    mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+    img_map = {extract_key(f): f for f in img_files}
+    mask_map = {extract_key(f): f for f in mask_files}
+    mask_keys = set(mask_map.keys())
+    valid_keys = sorted([k for k in img_map.keys() if k in mask_keys])
+    if not valid_keys:
+        raise RuntimeError("没有找到匹配的 img / mask 数据对")
+    return valid_keys
+
+
+def grouped_train_val_split(keys, train_ratio=0.75, val_ratio_within_trainval=0.20, seed=42):
+    group_map = {}
+    for key in keys:
+        gid = extract_group_id(key)
+        group_map.setdefault(gid, []).append(key)
+
+    groups = sorted(group_map.keys())
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+
+    total = len(keys)
+    trainval_target = max(1, int(total * train_ratio))
+    trainval_keys, holdout_keys = [], []
+
+    for gid in groups:
+        current = group_map[gid]
+        if len(trainval_keys) < trainval_target:
+            trainval_keys.extend(current)
+        else:
+            holdout_keys.extend(current)
+
+    if len(holdout_keys) == 0:
+        split_point = max(1, len(trainval_keys) // 5)
+        holdout_keys = trainval_keys[-split_point:]
+        trainval_keys = trainval_keys[:-split_point]
+
+    trainval_groups = sorted({extract_group_id(k) for k in trainval_keys})
+    rng.shuffle(trainval_groups)
+    val_target = max(1, int(len(trainval_keys) * val_ratio_within_trainval))
+
+    train_keys, val_keys = [], []
+    for gid in trainval_groups:
+        current = group_map[gid]
+        if len(val_keys) < val_target:
+            val_keys.extend(current)
+        else:
+            train_keys.extend(current)
+
+    if len(train_keys) == 0:
+        split_point = max(1, len(val_keys) // 2)
+        train_keys = val_keys[split_point:]
+        val_keys = val_keys[:split_point]
+
+    return sorted(train_keys), sorted(val_keys), sorted(holdout_keys)
+
+
+# ================================================================
+# 6. 损失函数
+# ================================================================
+class PrecisionAwareSegLoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.register_buffer("pos_weight_tensor", torch.tensor([pos_weight], dtype=torch.float32))
+        self.register_buffer('pos_weight_tensor', torch.tensor([CFG.pos_weight], dtype=torch.float32))
 
     def forward(self, logits, target):
-        if target.dim() == 4 and target.shape[1] == 1:
-            target = target.squeeze(1)
-        logits_flat = logits.view(-1)
-        target_flat = target.view(-1).float()
-        target_smooth = target_flat * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / 2.0
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+        probs = torch.sigmoid(logits)
+        sample_has_positive = (target.flatten(1).sum(dim=1) > 0).float().view(-1, 1, 1, 1)
 
-        probs = torch.sigmoid(logits_flat)
-        bce = F.binary_cross_entropy_with_logits(
-            logits_flat, target_smooth, pos_weight=self.pos_weight_tensor.to(logits.device)
+        target_smooth = target * (1.0 - CFG.label_smoothing) + 0.5 * CFG.label_smoothing
+
+        bce_map = F.binary_cross_entropy_with_logits(
+            logits,
+            target_smooth,
+            pos_weight=self.pos_weight_tensor.to(logits.device),
+            reduction='none'
         )
-        intersection = (probs * target_flat).sum()
-        dice_loss = 1.0 - (2.0 * intersection + 1.0) / (probs.sum() + target_flat.sum() + 1.0)
+        sample_scale = torch.where(
+            sample_has_positive > 0,
+            torch.ones_like(sample_has_positive),
+            torch.full_like(sample_has_positive, CFG.empty_mask_loss_scale)
+        )
+        bce = (bce_map * sample_scale).mean()
 
-        p_clamped = torch.clamp(probs, min=1.0e-7, max=1.0 - 1.0e-7)
-        p_t = p_clamped * target_flat + (1.0 - p_clamped) * (1.0 - target_flat)
-        focal_w = (1.0 - p_t) ** FOCAL_GAMMA
-        focal_loss = (
-            focal_w * F.binary_cross_entropy_with_logits(logits_flat, target_smooth, reduction="none")
-        ).mean()
+        dims = (0, 2, 3)
+        tp = (probs * target).sum(dims)
+        fp = (probs * (1.0 - target)).sum(dims)
+        fn = ((1.0 - probs) * target).sum(dims)
+        tversky = 1.0 - (tp + 1e-7) / (tp + CFG.tversky_alpha * fp + CFG.tversky_beta * fn + 1e-7)
+        tversky = tversky.mean()
 
-        return BCE_WEIGHT * bce + DICE_WEIGHT * dice_loss + FOCAL_WEIGHT * focal_loss
+        p_t = probs * target + (1.0 - probs) * (1.0 - target)
+        focal = ((1.0 - p_t).pow(CFG.focal_gamma) * F.binary_cross_entropy_with_logits(
+            logits, target_smooth, reduction='none'
+        )).mean()
+
+        background_probs = probs * (1.0 - target)
+        background_target = torch.zeros_like(background_probs)
+        background_loss = F.l1_loss(background_probs, background_target, reduction='mean')
+
+        neg_probs = probs[target < 0.5]
+        if neg_probs.numel() > 0:
+            k = max(1, int(neg_probs.numel() * CFG.hard_negative_ratio))
+            hard_negative_penalty = torch.topk(neg_probs, k=k).values.mean()
+        else:
+            hard_negative_penalty = logits.new_tensor(0.0)
+
+        return (
+            CFG.bce_weight * bce +
+            CFG.tversky_weight * tversky +
+            CFG.focal_weight * focal +
+            CFG.hard_negative_weight * hard_negative_penalty +
+            CFG.background_weight * background_loss
+        )
 
 
+# ================================================================
+# 7. 指标与阈值搜索
+# ================================================================
 @torch.no_grad()
-def compute_metrics(model, loader, criterion, device, threshold=PRED_THRESHOLD, desc="Eval"):
+def collect_predictions(model, loader, device, threshold):
     model.eval()
     total_loss = 0.0
-    batches = 0
-    tp = fp = fn = 0.0
-    for imgs, masks, _ in tqdm(loader, desc=desc, leave=False):
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
+    criterion = PrecisionAwareSegLoss().to(device)
+
+    for imgs, masks, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            out = model(imgs)
-            loss = criterion(out, masks)
-        total_loss += float(loss.item())
-        batches += 1
-        pred = (torch.sigmoid(out) > threshold).long().squeeze(1)
-        labels = (masks > 0.5).long()
-        tp += float(((pred == 1) & (labels == 1)).sum().item())
-        fp += float(((pred == 1) & (labels == 0)).sum().item())
-        fn += float(((pred == 0) & (labels == 1)).sum().item())
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            logits = model(imgs)
+            loss = criterion(logits, masks)
+        total_loss += loss.item()
 
-    eps = 1.0e-7
-    precision = (tp + eps) / (tp + fp + eps)
-    recall = (tp + eps) / (tp + fn + eps)
-    f1 = 2.0 * precision * recall / (precision + recall + eps)
-    iou = (tp + eps) / (tp + fp + fn + eps)
-    return total_loss / max(batches, 1), {"Precision": precision, "Recall": recall, "F1": f1, "IoU": iou}
+        probs = torch.sigmoid(logits)
+        pred = (probs > threshold).long().squeeze(1)
+        true = (masks > 0.5).long()
+
+        total_tp += ((pred == 1) & (true == 1)).sum().item()
+        total_fp += ((pred == 1) & (true == 0)).sum().item()
+        total_fn += ((pred == 0) & (true == 1)).sum().item()
+
+    if len(loader) == 0:
+        return 0.0, {'IoU': 0.0, 'F1': 0.0, 'Precision': 0.0, 'Recall': 0.0}
+
+    metrics = compute_metrics_from_counts(total_tp, total_fp, total_fn)
+    return total_loss / max(len(loader), 1), metrics
 
 
 @torch.no_grad()
 def search_best_threshold(model, loader, device):
     model.eval()
-    probs_list = []
-    masks_list = []
-    for imgs, masks, _ in tqdm(loader, desc="Searching threshold", leave=False):
+    criterion = PrecisionAwareSegLoss().to(device)
+    thresholds = [float(t) for t in CFG.threshold_candidates]
+    counts = {
+        thr: {'tp': 0.0, 'fp': 0.0, 'fn': 0.0}
+        for thr in thresholds
+    }
+    total_loss = 0.0
+
+    for imgs, masks, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            out = model(imgs)
-        probs = torch.sigmoid(out).cpu().numpy()[:, 0]
-        masks_np = masks.numpy()
-        for i in range(probs.shape[0]):
-            probs_list.append(probs[i])
-            masks_list.append(masks_np[i])
+        masks = masks.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            logits = model(imgs)
+            loss = criterion(logits, masks)
+        total_loss += loss.item()
 
-    best_thr = PRED_THRESHOLD
-    best_iou = -1.0
-    for thr in np.arange(0.35, 0.76, 0.05):
-        tp = fp = fn = 0.0
-        for prob, mask in zip(probs_list, masks_list):
-            pred = prob > thr
-            label = mask > 0.5
-            tp += float((pred & label).sum())
-            fp += float((pred & ~label).sum())
-            fn += float((~pred & label).sum())
-        iou = (tp + 1.0e-7) / (tp + fp + fn + 1.0e-7)
-        if iou > best_iou:
-            best_iou = iou
-            best_thr = float(thr)
-    return best_thr, best_iou
+        probs = torch.sigmoid(logits)
+        true = (masks > 0.5).long()
+        for thr in thresholds:
+            pred = (probs > thr).long().squeeze(1)
+            counts[thr]['tp'] += ((pred == 1) & (true == 1)).sum().item()
+            counts[thr]['fp'] += ((pred == 1) & (true == 0)).sum().item()
+            counts[thr]['fn'] += ((pred == 0) & (true == 1)).sum().item()
 
+    if len(loader) == 0:
+        return CFG.default_threshold, 0.0, {'IoU': 0.0, 'F1': 0.0, 'Precision': 0.0, 'Recall': 0.0}
 
-def save_prediction_figure(model, dataset, device, save_path, epoch, indices, band_idx, threshold):
-    model.eval()
-    indices = [idx for idx in indices if idx < len(dataset)]
-    if not indices:
-        return
-    fig, axes = plt.subplots(len(indices), 3, figsize=(15, 5 * len(indices)))
-    if len(indices) == 1:
-        axes = axes[np.newaxis, :]
-    with torch.no_grad():
-        for row, idx in enumerate(indices):
-            img, mask, key = dataset[idx]
-            inp = img.unsqueeze(0).to(device)
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(inp)
-            pred = (torch.sigmoid(out).squeeze().cpu().numpy() > threshold).astype(np.float32)
-            b = min(band_idx, img.shape[0] - 1)
-            band = img[b].numpy()
-            lo, hi = np.percentile(band, [2, 98])
-            band = np.clip((band - lo) / max(hi - lo, 1.0e-6), 0.0, 1.0)
-            axes[row, 0].imshow(band, cmap="gray")
-            axes[row, 0].set_title(f"{key}\nBand {b} ({BAND_NAMES[b]})", fontsize=8)
-            axes[row, 1].imshow(mask.numpy(), cmap="gray", vmin=0, vmax=1)
-            axes[row, 1].set_title("Ground Truth")
-            axes[row, 2].imshow(pred, cmap="gray", vmin=0, vmax=1)
-            axes[row, 2].set_title("Prediction")
-            for col in range(3):
-                axes[row, col].axis("off")
-    plt.suptitle(f"Epoch {epoch}, threshold={threshold:.2f}", fontsize=14)
-    plt.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
+    best_threshold = thresholds[0]
+    best_metrics = None
+    best_score = -1e9
+
+    for thr in thresholds:
+        metrics = compute_metrics_from_counts(counts[thr]['tp'], counts[thr]['fp'], counts[thr]['fn'])
+        score = compute_balance_score(metrics)
+        if metrics['Precision'] < CFG.min_precision_floor:
+            score -= (CFG.min_precision_floor - metrics['Precision']) * 0.5
+        if best_metrics is None or score > best_score:
+            best_threshold = thr
+            best_metrics = metrics
+            best_score = score
+
+    return best_threshold, total_loss / max(len(loader), 1), best_metrics
 
 
+def compute_metrics_from_counts(tp, fp, fn):
+    eps = 1e-7
+    precision = (tp + eps) / (tp + fp + eps)
+    recall = (tp + eps) / (tp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    iou = (tp + eps) / (tp + fp + fn + eps)
+
+    return {
+        'Precision': precision,
+        'Recall': recall,
+        'F1': f1,
+        'IoU': iou,
+    }
+
+
+# ================================================================
+# 8. 可视化与日志
+# ================================================================
 class TrainingLogger:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path
         self.h = {
-            "train_loss": [],
-            "val_loss": [],
-            "iou": [],
-            "f1": [],
-            "precision": [],
-            "recall": [],
-            "lr": [],
-            "threshold": [],
+            'epoch': [],
+            'train_loss': [],
+            'val_loss': [],
+            'iou': [],
+            'f1': [],
+            'precision': [],
+            'recall': [],
+            'lr': [],
+            'score': [],
+            'best_score': None,
+            'best_epoch': None,
         }
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            for k in self.h:
+                if k in saved:
+                    self.h[k] = saved[k]
 
-    def log(self, tl, vl, metrics, lr, threshold):
-        self.h["train_loss"].append(float(tl))
-        self.h["val_loss"].append(float(vl))
-        self.h["iou"].append(float(metrics["IoU"]))
-        self.h["f1"].append(float(metrics["F1"]))
-        self.h["precision"].append(float(metrics["Precision"]))
-        self.h["recall"].append(float(metrics["Recall"]))
-        self.h["lr"].append(float(lr))
-        self.h["threshold"].append(float(threshold))
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(self.h, f, indent=2)
+    def log(self, epoch, train_loss, val_loss, metrics, lr, score, best_score):
+        self.h['epoch'].append(int(epoch))
+        self.h['train_loss'].append(float(train_loss))
+        self.h['val_loss'].append(float(val_loss))
+        self.h['iou'].append(float(metrics['IoU']))
+        self.h['f1'].append(float(metrics['F1']))
+        self.h['precision'].append(float(metrics['Precision']))
+        self.h['recall'].append(float(metrics['Recall']))
+        self.h['lr'].append(float(lr))
+        self.h['score'].append(float(score))
+        self.h['best_score'] = float(best_score)
+        self.h['best_epoch'] = int(self.h['epoch'][int(np.argmax(self.h['score']))]) if self.h['score'] else None
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self.h, f, indent=2, ensure_ascii=False)
 
     def plot(self, path):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        axes[0, 0].plot(self.h["train_loss"], label="Train")
-        axes[0, 0].plot(self.h["val_loss"], label="Val")
-        axes[0, 0].set_title("Loss")
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        axes[0, 0].plot(self.h['train_loss'], label='Train Loss')
+        axes[0, 0].plot(self.h['val_loss'], label='Val Loss')
+        axes[0, 0].set_title('Loss Curve')
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
 
-        axes[0, 1].plot(self.h["iou"], label="IoU")
-        axes[0, 1].plot(self.h["f1"], label="F1")
-        axes[0, 1].set_title("Metrics at Fixed Threshold")
+        axes[0, 1].plot(self.h['iou'], label='IoU')
+        axes[0, 1].plot(self.h['f1'], label='F1', color='tab:orange')
+        axes[0, 1].plot(self.h['score'], label='Score', color='tab:purple')
+        axes[0, 1].set_title('Validation Metrics')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
 
-        axes[1, 0].plot(self.h["precision"], label="Precision")
-        axes[1, 0].plot(self.h["recall"], label="Recall")
-        axes[1, 0].set_title("Precision / Recall")
+        axes[1, 0].plot(self.h['precision'], label='Precision', color='tab:green')
+        axes[1, 0].plot(self.h['recall'], label='Recall', color='tab:red')
+        axes[1, 0].set_title('Precision / Recall Balance')
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
 
-        axes[1, 1].plot(self.h["lr"], label="LR", color="red")
-        axes[1, 1].set_title("Learning Rate")
-        axes[1, 1].set_yscale("log")
+        axes[1, 1].plot(self.h['lr'], label='Learning Rate', color='tab:brown')
+        axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].legend()
         axes[1, 1].grid(True, alpha=0.3)
 
-        axes[0, 2].plot(self.h["threshold"], label="Threshold", color="green")
-        axes[0, 2].set_title("Training Threshold")
-        axes[0, 2].grid(True, alpha=0.3)
-        axes[1, 2].axis("off")
         plt.tight_layout()
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=120)
         plt.close(fig)
 
 
-def make_loader(dataset, shuffle, generator=None, drop_last=False):
-    return DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle,
-        num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available(),
-        worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
-        generator=generator,
-        drop_last=drop_last,
-        persistent_workers=NUM_WORKERS > 0,
-    )
+def save_prediction_figure(model, dataset, device, save_path, epoch, threshold):
+    model.eval()
+    count = min(CFG.viz_sample_count, len(dataset))
+    if count == 0:
+        return
+
+    fig, axes = plt.subplots(count, 4, figsize=(16, 4 * count))
+    if count == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    with torch.no_grad():
+        for i in range(count):
+            img, mask, name = dataset[i]
+            inp = img.unsqueeze(0).to(device)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(inp)
+            prob = torch.sigmoid(logits).squeeze().cpu().numpy()
+            pred = (prob > threshold).astype(np.float32)
+            band_idx = min(CFG.viz_band_idx, img.shape[0] - 1)
+
+            axes[i, 0].imshow(img[band_idx].numpy(), cmap='gray')
+            axes[i, 0].set_title(f'Input: {name}')
+            axes[i, 0].axis('off')
+
+            axes[i, 1].imshow(mask.numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[i, 1].set_title('Mask')
+            axes[i, 1].axis('off')
+
+            im = axes[i, 2].imshow(prob, cmap='jet', vmin=0, vmax=1)
+            axes[i, 2].set_title('Probability')
+            axes[i, 2].axis('off')
+            plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.04)
+
+            axes[i, 3].imshow(pred, cmap='gray', vmin=0, vmax=1)
+            axes[i, 3].set_title(f'Binary @ {threshold:.3f}')
+            axes[i, 3].axis('off')
+
+    plt.suptitle(f'Epoch {epoch}', fontsize=14)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
 
 
-def save_json(path, obj):
-    with Path(path).open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+# ================================================================
+# 9. 学习率调度
+# ================================================================
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, total_epochs, warmup_epochs, min_lr):
+        self.optimizer = optimizer
+        self.total_epochs = total_epochs
+        self.warmup_epochs = max(1, warmup_epochs)
+        self.min_lr = min_lr
+        self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self.last_epoch = 0
+
+    def step(self):
+        self.last_epoch += 1
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * self.last_epoch / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
+
+    def state_dict(self):
+        return {'last_epoch': self.last_epoch}
+
+    def load_state_dict(self, state_dict):
+        self.last_epoch = state_dict.get('last_epoch', 0)
+        # 恢复后立即同步一次当前 lr
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * max(1, self.last_epoch) / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
 
 
+# ================================================================
+# 10. 训练主流程
+# ================================================================
 def main():
-    set_seed(SEED)
+    set_seed(CFG.seed)
     ensure_dirs()
+    save_config()
 
-    train_pairs = pair_files(TRAIN_IMG_DIR, TRAIN_MASK_DIR)
-    train_indices, val_indices = grouped_split(train_pairs, VAL_RATIO, SEED)
-    train_keys = {train_pairs[i][0] for i in train_indices}
-    val_keys = {train_pairs[i][0] for i in val_indices}
-    if train_keys & val_keys:
-        raise RuntimeError("Train/val split leakage detected")
-
-    band_mean, band_std = compute_band_stats(train_pairs, train_indices)
-    pos_weight = compute_pos_weight(train_pairs, train_indices) if AUTO_POS_WEIGHT else POS_WEIGHT
-
-    base_dataset = CrackDataset(train_pairs, augment=False, band_mean=band_mean, band_std=band_std)
-    train_ds = Subset(base_dataset, train_indices)
-    val_ds = Subset(base_dataset, val_indices)
-
-    test_loader = None
-    if TEST_IMG_DIR.is_dir() and TEST_MASK_DIR.is_dir():
-        test_pairs = pair_files(TEST_IMG_DIR, TEST_MASK_DIR)
-        test_dataset = CrackDataset(test_pairs, augment=False, band_mean=band_mean, band_std=band_std)
-        test_loader = make_loader(test_dataset, shuffle=False)
-        train_val_keys = train_keys | val_keys
-        test_keys = {key for key, _, _ in test_pairs}
-        if train_val_keys & test_keys:
-            raise RuntimeError("Train/test split leakage detected")
-    else:
-        test_pairs = []
-
-    generator = torch.Generator()
-    generator.manual_seed(SEED)
-    train_loader = make_loader(train_ds, shuffle=True, generator=generator, drop_last=False)
-    val_loader = make_loader(val_ds, shuffle=False)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"CUDA: {torch.cuda.get_device_name(0)}")
-
-    model = CrackSeg7Band(in_channels=IN_CHANNELS, classnum=1, base_dim=BASE_DIM, dropout=DROPOUT).to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
-    print(f"Train/Val/Test samples: {len(train_indices)}/{len(val_indices)}/{len(test_pairs)}")
-    print(f"Band mean: {band_mean.tolist()}")
-    print(f"Band std:  {band_std.tolist()}")
-    print(f"pos_weight: {pos_weight:.4f}")
-
-    criterion = DiceBCEFocalLoss(pos_weight=pos_weight).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=LEARNING_RATE,
-        epochs=EPOCHS,
-        steps_per_epoch=max(len(train_loader), 1),
-        pct_start=0.08,
-        div_factor=10,
-        final_div_factor=50,
+    valid_keys = collect_valid_keys(IMG_DIR, MASK_DIR)
+    train_keys, val_keys, holdout_keys = grouped_train_val_split(
+        valid_keys,
+        CFG.train_ratio,
+        CFG.val_ratio_within_trainval,
+        CFG.seed
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    ema = EMA(model, EMA_DECAY)
 
-    start_epoch = 0
-    best_iou = -1.0
-    best_epoch = 0
-    trigger = 0
+    train_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, train_keys, augment=True)
+    val_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, val_keys, augment=False)
+    holdout_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, holdout_keys, augment=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CFG.batch_size,
+        shuffle=True,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=len(train_ds) >= CFG.batch_size,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+    )
+    holdout_loader = DataLoader(
+        holdout_ds,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"设备: {device}")
+    print(f"数据根目录: {DATA_ROOT}")
+    print(f"训练样本: {len(train_ds)} | 验证样本: {len(val_ds)} | 保留测试样本: {len(holdout_ds)}")
+
+    train_groups = sorted({extract_group_id(k) for k in train_keys})
+    val_groups = sorted({extract_group_id(k) for k in val_keys})
+    holdout_groups = sorted({extract_group_id(k) for k in holdout_keys})
+    print(f"训练分组数: {len(train_groups)} | 验证分组数: {len(val_groups)} | 保留测试分组数: {len(holdout_groups)}")
+
+    model = CrackSeg7BandV5(
+        in_channels=CFG.in_channels,
+        base_dim=CFG.base_dim,
+        dropout=CFG.dropout
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {total_params:,}")
+
+    criterion = PrecisionAwareSegLoss().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    scheduler = WarmupCosineScheduler(optimizer, CFG.epochs, CFG.warmup_epochs, CFG.min_lr)
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    ema = EMA(model, decay=CFG.ema_decay)
     logger = TrainingLogger(TRAIN_LOG)
 
-    if RESUME_TRAINING and LATEST_CHECKPOINT.exists():
-        checkpoint = torch.load(LATEST_CHECKPOINT, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        ema.shadow = {k: v.to(device) for k, v in checkpoint["ema_shadow"].items()}
-        start_epoch = int(checkpoint["epoch"])
-        best_iou = float(checkpoint.get("best_iou", -1.0))
-        best_epoch = int(checkpoint.get("best_epoch", 0))
-        trigger = int(checkpoint.get("trigger", 0))
-        logger.h = checkpoint.get("history", logger.h)
-        print(f"Resumed from epoch {start_epoch}, best_iou={best_iou:.4f}")
+    start_epoch = 0
+    best_score = -1.0
+    best_metrics = None
+    best_holdout_metrics = None
+    best_threshold = CFG.default_threshold
+    patience_counter = 0
 
-    config = {
-        "data_dir": str(DEFAULT_DATA),
-        "output_root": str(OUTPUT_ROOT),
-        "epochs": EPOCHS,
-        "batch_size": BATCH_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "weight_decay": WEIGHT_DECAY,
-        "patience": PATIENCE,
-        "base_dim": BASE_DIM,
-        "dropout": DROPOUT,
-        "mixup_alpha": MIXUP_ALPHA,
-        "band_drop_prob": BAND_DROP_PROB,
-        "ema_decay": EMA_DECAY,
-        "val_ratio": VAL_RATIO,
-        "spatial_group_size": SPATIAL_GROUP_SIZE,
-        "pos_weight": pos_weight,
-        "band_mean": band_mean.tolist(),
-        "band_std": band_std.tolist(),
-        "train_count": len(train_indices),
-        "val_count": len(val_indices),
-        "test_count": len(test_pairs),
-    }
-    save_json(OUTPUT_ROOT / "config_7band_generalized.json", config)
+    if os.path.exists(LATEST_CHECKPOINT):
+        print(f"发现断点文件，恢复训练: {LATEST_CHECKPOINT}")
+        ckpt = torch.load(LATEST_CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        scaler.load_state_dict(ckpt['scaler_state_dict'])
+        ema.shadow = {k: v.to(device) for k, v in ckpt['ema_shadow'].items()}
+        start_epoch = ckpt['epoch']
+        best_score = ckpt.get('best_score', -1.0)
+        best_metrics = ckpt.get('best_metrics', None)
+        best_holdout_metrics = ckpt.get('best_holdout_metrics', None)
+        best_threshold = ckpt.get('best_threshold', CFG.default_threshold)
+        patience_counter = ckpt.get('patience_counter', 0)
 
-    for epoch in range(start_epoch, EPOCHS):
+    print("=" * 68)
+    print("7 波段训练 v5：Precision 优先 + 分组验证 + 快速收敛")
+    print(f"epochs={CFG.epochs}, batch={CFG.batch_size}, lr={CFG.lr}, min_lr={CFG.min_lr}")
+    print(f"pos_weight={CFG.pos_weight}, tversky_alpha={CFG.tversky_alpha}, tversky_beta={CFG.tversky_beta}")
+    print(f"hard_negative_ratio={CFG.hard_negative_ratio}, patience={CFG.patience}, thr_candidates={list(CFG.threshold_candidates)}")
+    print("=" * 68)
+
+    for epoch in range(start_epoch, CFG.epochs):
         ep = epoch + 1
-        base_dataset.augment = True
         model.train()
-        train_loss = 0.0
-        batches = 0
+        running_loss = 0.0
+        batch_count = 0
 
-        for imgs, masks, _ in tqdm(train_loader, desc=f"Epoch {ep:03d}"):
+        pbar = tqdm(train_loader, desc=f"Epoch {ep:03d}", dynamic_ncols=True)
+        for imgs, masks, _ in pbar:
             imgs = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
-            if MIXUP_ALPHA > 0 and random.random() < 0.20 and imgs.size(0) > 1:
-                lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
-                perm = torch.randperm(imgs.size(0), device=device)
-                imgs = lam * imgs + (1.0 - lam) * imgs[perm]
-                masks = lam * masks + (1.0 - lam) * masks[perm]
+            if CFG.mixup_alpha > 0.0 and random.random() < 0.25:
+                imgs, masks = beta_mixup(imgs, masks, CFG.mixup_alpha, device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(imgs)
-                loss = criterion(out, masks)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(imgs)
+                loss = criterion(logits, masks)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             ema.update()
 
-            train_loss += float(loss.item())
-            batches += 1
+            running_loss += loss.item()
+            batch_count += 1
+            pbar.set_postfix(loss=f"{running_loss / batch_count:.4f}")
 
-        if batches == 0:
+        scheduler.step()
+
+        if batch_count == 0:
             continue
 
-        base_dataset.augment = False
         ema.apply_shadow()
-        val_loss, metrics = compute_metrics(model, val_loader, criterion, device, PRED_THRESHOLD, desc="Validate")
+        val_threshold, val_loss, metrics = search_best_threshold(model, val_loader, device)
+        _, holdout_metrics = collect_predictions(model, holdout_loader, device, val_threshold)
         ema.restore()
 
-        avg_train_loss = train_loss / batches
-        lr = optimizer.param_groups[0]["lr"]
-        logger.log(avg_train_loss, val_loss, metrics, lr, PRED_THRESHOLD)
+        train_loss = running_loss / batch_count
+        current_lr = optimizer.param_groups[0]['lr']
+        score = 0.70 * compute_balance_score(metrics) + 0.30 * compute_balance_score(holdout_metrics)
 
-        improved = metrics["IoU"] > best_iou + MIN_DELTA
+        improved = score > best_score
         if improved:
-            best_iou = metrics["IoU"]
-            best_epoch = ep
-            trigger = 0
+            best_score = score
+            best_metrics = copy.deepcopy(metrics)
+            best_holdout_metrics = copy.deepcopy(holdout_metrics)
+            best_threshold = float(val_threshold)
+            patience_counter = 0
             ema.apply_shadow()
-            torch.save(model.state_dict(), CHECKPOINT)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'best_threshold': best_threshold,
+                'best_metrics': best_metrics,
+                'best_holdout_metrics': best_holdout_metrics,
+                'best_score': best_score,
+                'config': asdict(CFG),
+            }, CHECKPOINT)
             ema.restore()
-            msg = " >>> Best fixed-threshold IoU"
+            tag = ' >>> Best Score!'
         else:
-            trigger += 1
-            msg = f" Wait({trigger}/{PATIENCE})"
+            patience_counter += 1
+            tag = f' Wait({patience_counter}/{CFG.patience})'
 
-        torch.save(
-            {
-                "epoch": ep,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "ema_shadow": ema.shadow,
-                "best_iou": best_iou,
-                "best_epoch": best_epoch,
-                "trigger": trigger,
-                "history": logger.h,
-                "config": config,
-            },
-            LATEST_CHECKPOINT,
-        )
+        logger.log(ep, train_loss, val_loss, metrics, current_lr, score, best_score)
+
+        torch.save({
+            'epoch': ep,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'ema_shadow': ema.shadow,
+            'best_score': best_score,
+            'best_metrics': best_metrics,
+            'best_holdout_metrics': best_holdout_metrics,
+            'best_threshold': best_threshold,
+            'patience_counter': patience_counter,
+        }, LATEST_CHECKPOINT)
 
         print(
-            f"Ep{ep:03d} | Tr:{avg_train_loss:.4f} Va:{val_loss:.4f} | "
+            f"Ep{ep:03d} | Tr:{train_loss:.4f} Va:{val_loss:.4f} | "
             f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} | "
             f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} | "
-            f"Thr:{PRED_THRESHOLD:.2f} LR:{lr:.2e}{msg}"
+            f"HoldP:{holdout_metrics['Precision']:.4f} HoldR:{holdout_metrics['Recall']:.4f} | "
+            f"Score:{score:.4f} | Thr:{val_threshold:.3f} LR:{current_lr:.2e}{tag}"
         )
 
-        if ep % VIZ_EVERY == 0:
+        if CFG.viz_every > 0 and ep % CFG.viz_every == 0:
             ema.apply_shadow()
             save_prediction_figure(
                 model,
                 val_ds,
                 device,
-                OUTPUT_ROOT / "viz" / f"viz_ep{ep:03d}.png",
+                os.path.join(OUTPUT_ROOT, f"viz_ep{ep:03d}.png"),
                 ep,
-                VIZ_SAMPLE_INDICES,
-                VIZ_BAND_IDX,
-                PRED_THRESHOLD,
+                val_threshold
             )
             ema.restore()
 
-        if trigger >= PATIENCE:
-            print(f"Early stopping: no validation IoU improvement for {PATIENCE} epochs")
+        if patience_counter >= CFG.patience:
+            print(f"早停触发：连续 {CFG.patience} 个 epoch 综合得分未提升。")
             break
 
-    logger.plot(OUTPUT_ROOT / "training_curves_7band_generalized.png")
-
-    if CHECKPOINT.exists():
-        model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
-        print(f"Loaded best model from epoch {best_epoch}, fixed-threshold val IoU={best_iou:.4f}")
-
-    best_threshold, val_search_iou = search_best_threshold(model, val_loader, device)
-    val_loss, val_metrics = compute_metrics(model, val_loader, criterion, device, best_threshold, desc="Final Val")
-
-    results = {
-        "best_epoch": best_epoch,
-        "fixed_threshold": PRED_THRESHOLD,
-        "selected_threshold": best_threshold,
-        "val_threshold_search_iou": val_search_iou,
-        "final_val_loss": val_loss,
-        "final_val_metrics": val_metrics,
-    }
-
-    if test_loader is not None:
-        test_loss, test_metrics = compute_metrics(model, test_loader, criterion, device, best_threshold, desc="Final Test")
-        results["final_test_loss"] = test_loss
-        results["final_test_metrics"] = test_metrics
+    logger.plot(os.path.join(OUTPUT_ROOT, "training_curves_7band_v5.png"))
+    print("=" * 68)
+    print("训练完成")
+    print(f"最佳综合分数: {best_score:.4f}")
+    print(f"最佳阈值: {best_threshold:.3f}")
+    if best_metrics is not None:
         print(
-            f"Final Test | Loss:{test_loss:.4f} IoU:{test_metrics['IoU']:.4f} "
-            f"F1:{test_metrics['F1']:.4f} Prec:{test_metrics['Precision']:.4f} "
-            f"Rec:{test_metrics['Recall']:.4f} Thr:{best_threshold:.2f}"
+            f"最佳指标 => IoU:{best_metrics['IoU']:.4f}, F1:{best_metrics['F1']:.4f}, "
+            f"Precision:{best_metrics['Precision']:.4f}, Recall:{best_metrics['Recall']:.4f}"
         )
-
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "selected_threshold": best_threshold,
-            "band_mean": band_mean,
-            "band_std": band_std,
-            "config": config,
-            "results": results,
-        },
-        MODEL_DIR / "7band_best_model_with_preprocess.pth",
-    )
-    save_json(FINAL_METRICS, results)
-
-    print("=" * 60)
-    print(f"Training finished. Outputs: {OUTPUT_ROOT}")
-    print(f"Best state_dict: {CHECKPOINT}")
-    print(f"Model package with preprocessing: {MODEL_DIR / '7band_best_model_with_preprocess.pth'}")
-    print(f"Final metrics: {FINAL_METRICS}")
-    print("=" * 60)
+    if best_holdout_metrics is not None:
+        print(
+            f"保留测试指标 => IoU:{best_holdout_metrics['IoU']:.4f}, F1:{best_holdout_metrics['F1']:.4f}, "
+            f"Precision:{best_holdout_metrics['Precision']:.4f}, Recall:{best_holdout_metrics['Recall']:.4f}"
+        )
+    print(f"最佳模型: {CHECKPOINT}")
+    print(f"断点文件: {LATEST_CHECKPOINT}")
+    print(f"配置文件: {CONFIG_PATH}")
+    print("=" * 68)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
