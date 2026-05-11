@@ -1,1020 +1,905 @@
 #!/usr/bin/env python3
 """
-Train a 7-selected-band hyperspectral concrete crack segmentation model.
+Generalization-oriented 7-band MS-CrackSeg training script.
 
-Input:
-  7selectband/img/*.npy          image cubes, expected shape (7, H, W)
-  7selectband/masknpy/*.npy      binary masks, expected shape (H, W)
-  7selectband/testimg/*.npy      held-out test image cubes
-  7selectband/testmasknpy/*.npy  held-out test masks
-
-Output:
-  7output_results/7best_model.pth
-  7output_results/checkpoints/last_checkpoint.pth
-  7output_results/logs/metrics_log.txt
-  7output_results/logs/final_test_metrics.txt
-  7output_results/figures/*.png
-  7output_results/predictions/predictions_epoch_*.png
+This version fixes the main causes of optimistic validation metrics:
+1. strict image/mask pairing by spatial key;
+2. spatial-block validation split instead of random patch split;
+3. train-set per-band normalization applied to train/val/test;
+4. lower model capacity and stronger regularization;
+5. model selection at fixed threshold, with threshold search only after training;
+6. optional final evaluation on testimg/testmasknpy.
 """
 
-from __future__ import annotations
-
-import argparse
 import json
 import math
 import os
 import random
 import re
-import sys
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
 
-try:
-    import numpy as np
-    import matplotlib
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+import matplotlib
 
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
-    from tqdm import tqdm
-except ModuleNotFoundError as exc:
-    missing = exc.name or str(exc)
-    raise SystemExit(
-        f"Missing dependency: {missing}\n"
-        "Please install numpy, matplotlib, tqdm, and a CUDA-enabled PyTorch build if training on GPU."
-    ) from exc
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+from tqdm import tqdm
 
 
-@dataclass
-class Config:
-    # Paths
-    base_dir: Path = Path(__file__).resolve().parent
-    dataset_dir: Path = base_dir / "7selectband"
-    train_img_dir: Path = dataset_dir / "img"
-    train_mask_dir: Path = dataset_dir / "masknpy"
-    test_img_dir: Path = dataset_dir / "testimg"
-    test_mask_dir: Path = dataset_dir / "testmasknpy"
-    output_dir: Path = base_dir / "7output_results"
-    checkpoint_dir: Path = output_dir / "checkpoints"
-    figure_dir: Path = output_dir / "figures"
-    prediction_dir: Path = output_dir / "predictions"
-    log_dir: Path = output_dir / "logs"
-    best_model_path: Path = output_dir / "7best_model.pth"
-    last_checkpoint_path: Path = checkpoint_dir / "last_checkpoint.pth"
+# Paths
+DEFAULT_DATA = Path(os.environ.get("CRACK_DATA_DIR", "/root/autodl-tmp/reduction_band/7selectband"))
+TRAIN_IMG_DIR = DEFAULT_DATA / "img"
+TRAIN_MASK_DIR = DEFAULT_DATA / "masknpy"
+TEST_IMG_DIR = DEFAULT_DATA / "testimg"
+TEST_MASK_DIR = DEFAULT_DATA / "testmasknpy"
 
-    # Selected spectral bands from GaiaSky-mini 2, 394-1001 nm.
-    selected_wavelengths: Tuple[float, ...] = (942.0, 935.1, 903.9, 577.8, 532.7, 397.5, 456.4)
-
-    # Reproducibility and data
-    seed: int = 42
-    num_bands: int = 7
-    val_ratio: float = 0.2
-    threshold: float = 0.5
-    num_workers: int = 4
-    pin_memory: bool = True
-
-    # Training, kept aligned with train_88bands_mscrackseg.py for controlled comparison.
-    epochs: int = 200
-    batch_size: int = 2
-    learning_rate: float = 1.0e-3
-    min_lr: float = 1.0e-6
-    warmup_epochs: int = 5
-    warmup_start_lr: float = 1.0e-6
-    weight_decay: float = 1.0e-4
-    dice_loss_weight: float = 0.5
-    max_pos_weight: float = 20.0
-    grad_clip_norm: float = 1.0
-    use_amp: bool = True
-
-    # Augmentation, kept aligned with train_88bands_mscrackseg.py.
-    brightness_scale_min: float = 0.90
-    brightness_scale_max: float = 1.10
-    spectral_scale_min: float = 0.95
-    spectral_scale_max: float = 1.05
-    spectral_dropout_prob: float = 0.25
-    spectral_dropout_max_ratio: float = 0.05
-
-    # Output
-    prediction_interval: int = 50
-    prediction_samples: int = 4
+OUTPUT_ROOT = Path(
+    os.environ.get("CRACK_OUTPUT_DIR", "/root/autodl-tmp/reduction_band/output_results_7band/output4_generalized")
+)
+MODEL_DIR = OUTPUT_ROOT / "models"
+CHECKPOINT = MODEL_DIR / "7band_best_model.pth"
+LATEST_CHECKPOINT = MODEL_DIR / "latest_checkpoint.pth"
+TRAIN_LOG = OUTPUT_ROOT / "training_log_7band_generalized.json"
+FINAL_METRICS = OUTPUT_ROOT / "final_metrics_7band_generalized.json"
 
 
-CFG = Config()
+# Training hyperparameters
+IN_CHANNELS = 7
+EPOCHS = 300
+BATCH_SIZE = 16
+LEARNING_RATE = 2.0e-4
+WEIGHT_DECAY = 1.0e-3
+PATIENCE = 30
+NUM_WORKERS = 0
+SEED = 42
+GRAD_CLIP = 1.0
+PRED_THRESHOLD = 0.5
+MIN_DELTA = 1.0e-4
+VAL_RATIO = 0.2
+SPATIAL_GROUP_SIZE = 4
+RESUME_TRAINING = False
+
+
+# Loss and regularization
+POS_WEIGHT = 4.0
+AUTO_POS_WEIGHT = True
+MAX_POS_WEIGHT = 6.0
+DICE_WEIGHT = 0.65
+BCE_WEIGHT = 0.25
+FOCAL_WEIGHT = 0.10
+FOCAL_GAMMA = 2.0
+LABEL_SMOOTHING = 0.02
+
+BASE_DIM = 16
+DROPOUT = 0.35
+MIXUP_ALPHA = 0.10
+BAND_DROP_PROB = 0.20
+EMA_DECAY = 0.995
+
+
+# Visualization
+VIZ_BAND_IDX = 3
+VIZ_EVERY = 20
+VIZ_SAMPLE_INDICES = [0, 1, 2]
+BAND_NAMES = ["397.5nm", "456.4nm", "532.7nm", "577.8nm", "903.9nm", "935.1nm", "942.0nm"]
+
 KEY_PATTERN = re.compile(r"(r\d+c\d+col\d+row\d+overlap\d+)", re.IGNORECASE)
+SPATIAL_PATTERN = re.compile(r"r(\d+)c(\d+)col(\d+)row(\d+)overlap(\d+)", re.IGNORECASE)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train MS-CrackSeg on 7 selected hyperspectral bands.")
-    parser.add_argument("--dataset-dir", type=Path, default=None, help="Dataset root with img/masknpy/testimg/testmasknpy.")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory.")
-    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size.")
-    parser.add_argument("--lr", type=float, default=None, help="Initial learning rate.")
-    parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers.")
-    parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
-    parser.add_argument("--fresh", action="store_true", help="Do not resume from last checkpoint.")
-    return parser.parse_args()
-
-
-def apply_args(cfg: Config, args: argparse.Namespace) -> None:
-    if args.dataset_dir is not None:
-        cfg.dataset_dir = args.dataset_dir.resolve()
-        cfg.train_img_dir = cfg.dataset_dir / "img"
-        cfg.train_mask_dir = cfg.dataset_dir / "masknpy"
-        cfg.test_img_dir = cfg.dataset_dir / "testimg"
-        cfg.test_mask_dir = cfg.dataset_dir / "testmasknpy"
-    if args.output_dir is not None:
-        cfg.output_dir = args.output_dir.resolve()
-        cfg.checkpoint_dir = cfg.output_dir / "checkpoints"
-        cfg.figure_dir = cfg.output_dir / "figures"
-        cfg.prediction_dir = cfg.output_dir / "predictions"
-        cfg.log_dir = cfg.output_dir / "logs"
-        cfg.best_model_path = cfg.output_dir / "7best_model.pth"
-        cfg.last_checkpoint_path = cfg.checkpoint_dir / "last_checkpoint.pth"
-    if args.epochs is not None:
-        cfg.epochs = args.epochs
-    if args.batch_size is not None:
-        cfg.batch_size = args.batch_size
-    if args.lr is not None:
-        cfg.learning_rate = args.lr
-    if args.num_workers is not None:
-        cfg.num_workers = args.num_workers
-    if args.no_amp:
-        cfg.use_amp = False
-
-
-def set_seed(seed: int) -> None:
-    os.environ["PYTHONHASHSEED"] = str(seed)
+def set_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-        torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
 
 
-def seed_worker(worker_id: int) -> None:
+def seed_worker(worker_id):
     worker_seed = (torch.initial_seed() + worker_id) % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
-def ensure_dirs(cfg: Config) -> None:
-    for path in [cfg.output_dir, cfg.checkpoint_dir, cfg.figure_dir, cfg.prediction_dir, cfg.log_dir]:
-        path.mkdir(parents=True, exist_ok=True)
+def ensure_dirs():
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_ROOT / "viz").mkdir(parents=True, exist_ok=True)
 
 
-def has_dataset_layout(path: Path) -> bool:
-    return all((path / name).is_dir() for name in ["img", "masknpy", "testimg", "testmasknpy"])
-
-
-def dataset_layout_report(path: Path) -> str:
-    parts = []
-    for name in ["img", "masknpy", "testimg", "testmasknpy"]:
-        parts.append(f"{name}={'OK' if (path / name).is_dir() else 'MISS'}")
-    return f"{path}: " + ", ".join(parts)
-
-
-def resolve_dataset_paths(cfg: Config) -> None:
-    candidates: List[Path] = [
-        cfg.dataset_dir,
-        cfg.base_dir / "7selectband",
-        cfg.base_dir / "7SelectBand",
-        cfg.base_dir / "selected_7bands",
-        cfg.base_dir / "7bands",
-    ]
-    for child in sorted(cfg.base_dir.iterdir()) if cfg.base_dir.is_dir() else []:
-        if child.is_dir():
-            candidates.append(child)
-
-    seen = set()
-    unique_candidates = []
-    for path in candidates:
-        resolved = path.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            unique_candidates.append(resolved)
-
-    for path in unique_candidates:
-        if has_dataset_layout(path):
-            cfg.dataset_dir = path
-            cfg.train_img_dir = path / "img"
-            cfg.train_mask_dir = path / "masknpy"
-            cfg.test_img_dir = path / "testimg"
-            cfg.test_mask_dir = path / "testmasknpy"
-            print(f"Dataset root: {cfg.dataset_dir}")
-            return
-
-    existing = [path for path in unique_candidates if path.exists()]
-    reports = "\n".join(dataset_layout_report(path) for path in existing[:30])
-    raise FileNotFoundError(
-        "Could not find a complete 7-band dataset directory. Expected one folder containing "
-        "img, masknpy, testimg, and testmasknpy.\nChecked existing candidates:\n"
-        f"{reports if reports else '(no candidate paths exist)'}"
-    )
-
-
-def extract_key(path: Path) -> str:
-    match = KEY_PATTERN.search(path.stem)
+def extract_key(filename):
+    match = KEY_PATTERN.search(Path(filename).stem)
     if match is None:
-        raise ValueError(f"Cannot extract sample key from filename: {path.name}")
+        raise ValueError(f"Cannot extract spatial key from filename: {filename}")
     return match.group(1).lower()
 
 
-def pair_files(img_dir: Path, mask_dir: Path) -> List[Tuple[str, Path, Path]]:
+def read_image(path):
+    img = np.load(path).astype(np.float32, copy=False)
+    img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+    if img.ndim == 4 and 1 in img.shape:
+        img = np.squeeze(img)
+    if img.ndim != 3:
+        raise ValueError(f"Image must be 3D, got {img.shape}: {path}")
+    if img.shape[0] == IN_CHANNELS:
+        return np.ascontiguousarray(img, dtype=np.float32)
+    if img.shape[-1] == IN_CHANNELS:
+        return np.ascontiguousarray(np.transpose(img, (2, 0, 1)), dtype=np.float32)
+    raise ValueError(f"Image must have {IN_CHANNELS} bands, got {img.shape}: {path}")
+
+
+def read_mask(path):
+    mask = np.load(path)
+    mask = np.squeeze(mask)
+    if mask.ndim != 2:
+        raise ValueError(f"Mask must be 2D after squeeze, got {mask.shape}: {path}")
+    return np.ascontiguousarray((mask > 0).astype(np.float32))
+
+
+def pair_files(img_dir, mask_dir):
+    img_dir = Path(img_dir)
+    mask_dir = Path(mask_dir)
     if not img_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {img_dir}")
     if not mask_dir.is_dir():
         raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
 
-    img_files = sorted(img_dir.glob("*.npy"))
-    mask_files = sorted(mask_dir.glob("*.npy"))
-    if not img_files:
-        raise RuntimeError(f"No .npy image files found in: {img_dir}")
-    if not mask_files:
-        raise RuntimeError(f"No .npy mask files found in: {mask_dir}")
+    images = sorted(img_dir.glob("*.npy"))
+    masks = sorted(mask_dir.glob("*.npy"))
+    if not images:
+        raise RuntimeError(f"No .npy images found in {img_dir}")
+    if not masks:
+        raise RuntimeError(f"No .npy masks found in {mask_dir}")
 
-    img_by_key: Dict[str, Path] = {}
-    mask_by_key: Dict[str, Path] = {}
-    for path in img_files:
-        key = extract_key(path)
-        if key in img_by_key:
-            raise RuntimeError(f"Duplicate image key {key}: {img_by_key[key].name}, {path.name}")
-        img_by_key[key] = path
-    for path in mask_files:
-        key = extract_key(path)
+    image_by_key = {}
+    mask_by_key = {}
+    for path in images:
+        key = extract_key(path.name)
+        if key in image_by_key:
+            raise RuntimeError(f"Duplicate image key {key}: {image_by_key[key].name}, {path.name}")
+        image_by_key[key] = path
+    for path in masks:
+        key = extract_key(path.name)
         if key in mask_by_key:
             raise RuntimeError(f"Duplicate mask key {key}: {mask_by_key[key].name}, {path.name}")
         mask_by_key[key] = path
 
-    img_keys = set(img_by_key)
-    mask_keys = set(mask_by_key)
-    missing_masks = sorted(img_keys - mask_keys)
-    missing_imgs = sorted(mask_keys - img_keys)
-    if missing_masks or missing_imgs:
-        report = []
-        if missing_masks:
-            report.append(f"missing masks for {len(missing_masks)} image keys, first: {missing_masks[:5]}")
-        if missing_imgs:
-            report.append(f"missing images for {len(missing_imgs)} mask keys, first: {missing_imgs[:5]}")
-        raise RuntimeError("; ".join(report))
-
-    return [(key, img_by_key[key], mask_by_key[key]) for key in sorted(img_keys)]
-
-
-def load_image_array(path: Path, num_bands: int) -> np.ndarray:
-    arr = np.load(path).astype(np.float32, copy=False)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if arr.ndim == 4 and 1 in arr.shape:
-        arr = np.squeeze(arr)
-    if arr.ndim != 3:
-        raise ValueError(f"Image must be 3D, got shape {arr.shape} for {path.name}")
-    if arr.shape[0] == num_bands:
-        pass
-    elif arr.shape[-1] == num_bands:
-        arr = np.transpose(arr, (2, 0, 1))
-    else:
-        raise ValueError(f"Image must contain {num_bands} bands, got shape {arr.shape} for {path.name}")
-    return np.ascontiguousarray(arr, dtype=np.float32)
-
-
-def load_mask_array(path: Path) -> np.ndarray:
-    arr = np.load(path)
-    arr = np.squeeze(arr)
-    if arr.ndim != 2:
-        raise ValueError(f"Mask must be 2D after squeeze, got shape {arr.shape} for {path.name}")
-    arr = (arr > 0).astype(np.float32)
-    return np.ascontiguousarray(arr)
-
-
-def validate_shapes(pairs: Sequence[Tuple[str, Path, Path]], cfg: Config, name: str) -> None:
-    if not pairs:
-        raise RuntimeError(f"{name} pair list is empty")
-    sample_indices = sorted(set([0, len(pairs) // 2, len(pairs) - 1]))
-    for idx in sample_indices:
-        key, img_path, mask_path = pairs[idx]
-        image = load_image_array(img_path, cfg.num_bands)
-        mask = load_mask_array(mask_path)
-        if image.shape[1:] != mask.shape:
-            raise ValueError(
-                f"Image/mask spatial shape mismatch for key {key}: image {image.shape}, mask {mask.shape}"
-            )
-
-
-def split_train_val(
-    pairs: Sequence[Tuple[str, Path, Path]], val_ratio: float, seed: int
-) -> Tuple[List[Tuple[str, Path, Path]], List[Tuple[str, Path, Path]]]:
-    if not 0.0 < val_ratio < 1.0:
-        raise ValueError("val_ratio must be between 0 and 1")
-    rng = np.random.default_rng(seed)
-    indices = np.arange(len(pairs))
-    rng.shuffle(indices)
-    val_count = max(1, int(round(len(pairs) * val_ratio)))
-    val_indices = set(indices[:val_count].tolist())
-    train_pairs = [pair for i, pair in enumerate(pairs) if i not in val_indices]
-    val_pairs = [pair for i, pair in enumerate(pairs) if i in val_indices]
-    return train_pairs, val_pairs
-
-
-def augment_sample(image: np.ndarray, mask: np.ndarray, cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
-    if random.random() < 0.5:
-        image = np.flip(image, axis=2)
-        mask = np.flip(mask, axis=1)
-    if random.random() < 0.5:
-        image = np.flip(image, axis=1)
-        mask = np.flip(mask, axis=0)
-
-    k = random.randint(0, 3)
-    if k:
-        image = np.rot90(image, k=k, axes=(1, 2))
-        mask = np.rot90(mask, k=k, axes=(0, 1))
-
-    if random.random() < 0.5:
-        image = np.transpose(image, (0, 2, 1))
-        mask = np.transpose(mask, (1, 0))
-
-    brightness = random.uniform(cfg.brightness_scale_min, cfg.brightness_scale_max)
-    image = image * brightness
-
-    if random.random() < 0.5:
-        band_scale = np.random.uniform(
-            cfg.spectral_scale_min, cfg.spectral_scale_max, size=(image.shape[0], 1, 1)
-        ).astype(np.float32)
-        image = image * band_scale
-
-    if random.random() < cfg.spectral_dropout_prob:
-        max_drop = max(1, int(round(image.shape[0] * cfg.spectral_dropout_max_ratio)))
-        drop_count = random.randint(1, max_drop)
-        drop_idx = np.random.choice(image.shape[0], size=drop_count, replace=False)
-        image = image.copy()
-        image[drop_idx] = 0.0
-
-    return np.ascontiguousarray(image, dtype=np.float32), np.ascontiguousarray(mask, dtype=np.float32)
-
-
-class CrackNpyDataset(Dataset):
-    def __init__(self, pairs: Sequence[Tuple[str, Path, Path]], cfg: Config, augment: bool = False) -> None:
-        self.pairs = list(pairs)
-        self.cfg = cfg
-        self.augment = augment
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        key, img_path, mask_path = self.pairs[index]
-        image = load_image_array(img_path, self.cfg.num_bands)
-        mask = load_mask_array(mask_path)
-        if image.shape[1:] != mask.shape:
-            raise ValueError(f"Spatial mismatch for {key}: image {image.shape}, mask {mask.shape}")
-        if self.augment:
-            image, mask = augment_sample(image, mask, self.cfg)
-        image_tensor = torch.from_numpy(image).unsqueeze(0)  # [1, D, H, W]
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # [1, H, W]
-        return image_tensor, mask_tensor, key
-
-
-class DilateAttention(nn.Module):
-    def __init__(self, in_channel: int, depth: int) -> None:
-        super().__init__()
-        self.batch_norm = nn.BatchNorm3d(in_channel)
-        self.relu = nn.ReLU(inplace=True)
-        self.atrous_block1 = nn.Conv3d(in_channel, depth, kernel_size=1, stride=1)
-        self.atrous_block2 = nn.Conv3d(
-            in_channel, depth, kernel_size=3, stride=1, padding=2, dilation=2, groups=in_channel
+    missing_masks = sorted(set(image_by_key) - set(mask_by_key))
+    missing_images = sorted(set(mask_by_key) - set(image_by_key))
+    if missing_masks or missing_images:
+        raise RuntimeError(
+            f"Pairing failed: missing_masks={missing_masks[:5]}, missing_images={missing_images[:5]}"
         )
-        self.atrous_block3 = nn.Conv3d(
-            in_channel, depth, kernel_size=3, stride=1, padding=4, dilation=4, groups=in_channel
-        )
-        self.softmax = nn.Softmax(dim=2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        v = self.atrous_block1(x)
-        q = self.atrous_block2(x)
-        k = self.atrous_block3(x)
-        attention = self.softmax(k * q)
-        return v * attention + self.relu(self.batch_norm(x))
+    return [(key, image_by_key[key], mask_by_key[key]) for key in sorted(image_by_key)]
 
 
-class MScrackSeg7(nn.Module):
-    """MS-CrackSeg variant for 7 selected bands.
-
-    The 88-band baseline pools along spectral and spatial axes. With only 7
-    selected bands, three spectral poolings would collapse the depth dimension.
-    This version keeps the spectral axis at 7 and downsamples only H/W, allowing
-    controlled comparison while preserving all selected wavelengths.
-    """
-
-    def __init__(self, in_channel: int = 1, classnum: int = 1, num_bands: int = 7, dim: int = 8) -> None:
-        super().__init__()
-        self.dim = dim
-        self.num_bands = num_bands
-
-        self.conv3d1 = nn.Conv3d(in_channel, dim, kernel_size=(7, 7, 7), padding=3, stride=1)
-        self.maxpooling1 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.dilatation1 = DilateAttention(dim, dim)
-
-        self.conv3d2 = nn.Conv3d(dim, dim, kernel_size=(7, 7, 7), padding=3, stride=1)
-        self.maxpooling2 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.dilatation2 = DilateAttention(dim, dim)
-
-        self.conv3d3 = nn.Conv3d(dim, dim, kernel_size=(7, 7, 7), padding=3, stride=1)
-        self.maxpooling3 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.dilatation3 = DilateAttention(dim, dim)
-
-        self.transpose1 = nn.ConvTranspose3d(dim, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.conv_up1 = nn.Conv3d(dim, dim, kernel_size=(7, 7, 7), padding=3, stride=1)
-
-        self.transpose2 = nn.ConvTranspose3d(dim * 2, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.conv_up2 = nn.Conv3d(dim, dim, kernel_size=7, padding=3, stride=1)
-
-        self.transpose3 = nn.ConvTranspose3d(dim * 2, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.conv_up3 = nn.Conv3d(dim, 1, kernel_size=7, padding=3, stride=1)
-
-        self.final = nn.Conv2d(num_bands, classnum, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.conv3d1(x)
-        x1 = self.maxpooling1(x1)
-        x1 = self.dilatation1(x1)
-
-        x2 = self.conv3d2(x1)
-        x2 = self.maxpooling2(x2)
-        x2 = self.dilatation2(x2)
-
-        x3 = self.conv3d3(x2)
-        x3 = self.maxpooling3(x3)
-        x3 = self.dilatation3(x3)
-
-        x4 = self.transpose1(x3)
-        x4 = self.conv_up1(x4)
-        x4 = torch.cat([x4, x2], dim=1)
-
-        x5 = self.transpose2(x4)
-        x5 = self.conv_up2(x5)
-        x6 = torch.cat([x5, x1], dim=1)
-
-        x6 = self.transpose3(x6)
-        x6 = self.conv_up3(x6)
-        x6 = torch.squeeze(x6, dim=1)  # [B, D, H, W]
-        return self.final(x6)  # [B, 1, H, W]
+def spatial_group(key):
+    match = SPATIAL_PATTERN.search(key)
+    if match is None:
+        return key
+    r, c, col, row, _ = [int(v) for v in match.groups()]
+    return (r, c, col // SPATIAL_GROUP_SIZE, row // SPATIAL_GROUP_SIZE)
 
 
-class DiceLoss(nn.Module):
-    def __init__(self, smooth: float = 1.0) -> None:
-        super().__init__()
-        self.smooth = smooth
+def grouped_split(pairs, val_ratio=VAL_RATIO, seed=SEED):
+    groups = {}
+    for idx, (key, _, _) in enumerate(pairs):
+        groups.setdefault(spatial_group(key), []).append(idx)
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        probs = probs.reshape(probs.shape[0], -1)
-        targets = targets.reshape(targets.shape[0], -1)
-        intersection = (probs * targets).sum(dim=1)
-        denominator = probs.sum(dim=1) + targets.sum(dim=1)
-        dice = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
-        return 1.0 - dice.mean()
+    group_items = list(groups.items())
+    rng = random.Random(seed)
+    rng.shuffle(group_items)
+
+    target_val = max(1, int(round(len(pairs) * val_ratio)))
+    val_indices = []
+    train_indices = []
+    for _, indices in group_items:
+        if len(val_indices) < target_val:
+            val_indices.extend(indices)
+        else:
+            train_indices.extend(indices)
+
+    if not train_indices or not val_indices:
+        indices = list(range(len(pairs)))
+        rng.shuffle(indices)
+        val_count = max(1, int(round(len(indices) * val_ratio)))
+        val_indices = indices[:val_count]
+        train_indices = indices[val_count:]
+
+    return sorted(train_indices), sorted(val_indices)
 
 
-class CombinedLoss(nn.Module):
-    def __init__(self, pos_weight: torch.Tensor, dice_weight: float) -> None:
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        self.dice = DiceLoss()
-        self.dice_weight = dice_weight
+def compute_band_stats(pairs, indices):
+    sums = np.zeros(IN_CHANNELS, dtype=np.float64)
+    sq_sums = np.zeros(IN_CHANNELS, dtype=np.float64)
+    count = 0
+    for idx in tqdm(indices, desc="Computing band mean/std", leave=False):
+        img = read_image(pairs[idx][1])
+        flat = img.reshape(IN_CHANNELS, -1).astype(np.float64)
+        sums += flat.sum(axis=1)
+        sq_sums += (flat * flat).sum(axis=1)
+        count += flat.shape[1]
+    mean = sums / max(count, 1)
+    var = sq_sums / max(count, 1) - mean * mean
+    std = np.sqrt(np.maximum(var, 1.0e-8))
+    return mean.astype(np.float32), std.astype(np.float32)
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.bce(logits, targets) + self.dice_weight * self.dice(logits, targets)
 
-
-def compute_pos_weight(pairs: Sequence[Tuple[str, Path, Path]], cfg: Config) -> float:
+def compute_pos_weight(pairs, indices):
     positives = 0.0
     total = 0.0
-    for _, _, mask_path in tqdm(pairs, desc="Computing pos_weight", leave=False):
-        mask = load_mask_array(mask_path)
+    for idx in tqdm(indices, desc="Computing pos_weight", leave=False):
+        mask = read_mask(pairs[idx][2])
         positives += float(mask.sum())
         total += float(mask.size)
     negatives = max(total - positives, 1.0)
     positives = max(positives, 1.0)
-    return float(np.clip(negatives / positives, 1.0, cfg.max_pos_weight))
+    return float(np.clip(negatives / positives, 1.0, MAX_POS_WEIGHT))
 
 
-def learning_rate_for_epoch(epoch: int, cfg: Config) -> float:
-    if cfg.warmup_epochs > 0 and epoch <= cfg.warmup_epochs:
-        alpha = epoch / float(cfg.warmup_epochs)
-        return cfg.warmup_start_lr + alpha * (cfg.learning_rate - cfg.warmup_start_lr)
-    if cfg.epochs <= cfg.warmup_epochs:
-        return cfg.learning_rate
-    progress = (epoch - cfg.warmup_epochs) / float(cfg.epochs - cfg.warmup_epochs)
-    progress = min(max(progress, 0.0), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.min_lr + cosine * (cfg.learning_rate - cfg.min_lr)
+class CrackDataset(Dataset):
+    def __init__(self, pairs, augment=False, band_mean=None, band_std=None):
+        self.pairs = list(pairs)
+        self.augment = augment
+        self.band_mean = None if band_mean is None else np.asarray(band_mean, dtype=np.float32).reshape(-1, 1, 1)
+        self.band_std = None if band_std is None else np.asarray(band_std, dtype=np.float32).reshape(-1, 1, 1)
+        if not self.pairs:
+            raise RuntimeError("Dataset is empty")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def set_normalization(self, band_mean, band_std):
+        self.band_mean = np.asarray(band_mean, dtype=np.float32).reshape(-1, 1, 1)
+        self.band_std = np.asarray(band_std, dtype=np.float32).reshape(-1, 1, 1)
+
+    def _normalize(self, img):
+        if self.band_mean is None or self.band_std is None:
+            lo = np.percentile(img, 1, axis=(1, 2), keepdims=True)
+            hi = np.percentile(img, 99, axis=(1, 2), keepdims=True)
+            return np.clip((img - lo) / np.maximum(hi - lo, 1.0e-6), 0.0, 1.0)
+        img = (img - self.band_mean) / np.maximum(self.band_std, 1.0e-6)
+        return np.clip(img, -5.0, 5.0)
+
+    def __getitem__(self, idx):
+        key, img_path, mask_path = self.pairs[idx]
+        img = read_image(img_path)
+        mask = read_mask(mask_path)
+
+        if img.shape[1:] != mask.shape:
+            raise ValueError(f"Spatial mismatch for {key}: image={img.shape}, mask={mask.shape}")
+
+        if self.augment:
+            if random.random() < 0.5:
+                img = img[:, :, ::-1].copy()
+                mask = mask[:, ::-1].copy()
+            if random.random() < 0.5:
+                img = img[:, ::-1, :].copy()
+                mask = mask[::-1, :].copy()
+            if random.random() < 0.5:
+                k = random.choice([1, 2, 3])
+                img = np.rot90(img, k, axes=(1, 2)).copy()
+                mask = np.rot90(mask, k, axes=(0, 1)).copy()
+            if random.random() < 0.35:
+                img = img * np.random.uniform(0.85, 1.15)
+            if random.random() < 0.35:
+                scale = np.random.uniform(0.90, 1.10, (img.shape[0], 1, 1)).astype(np.float32)
+                img = img * scale
+
+        img = self._normalize(img)
+
+        if self.augment:
+            if random.random() < 0.25:
+                img = img + np.random.normal(0.0, 0.03, img.shape).astype(np.float32)
+            if random.random() < BAND_DROP_PROB:
+                drop_idx = np.random.choice(img.shape[0], 1, replace=False)
+                img = img.copy()
+                img[drop_idx] = 0.0
+
+        return torch.from_numpy(img.astype(np.float32)), torch.from_numpy(mask.astype(np.float32)), key
 
 
-def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr
+class EMA:
+    def __init__(self, model, decay=EMA_DECAY):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.detach()
+
+    def apply_shadow(self):
+        self.backup = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
 
 
-def empty_metrics() -> Dict[str, float]:
-    return {"tp": 0.0, "tn": 0.0, "fp": 0.0, "fn": 0.0}
+def group_norm(channels):
+    groups = 8
+    while channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
 
 
-def update_confusion(stats: Dict[str, float], logits: torch.Tensor, targets: torch.Tensor, threshold: float) -> None:
-    probs = torch.sigmoid(logits)
-    preds = probs >= threshold
-    labels = targets >= 0.5
-    stats["tp"] += float((preds & labels).sum().item())
-    stats["tn"] += float((~preds & ~labels).sum().item())
-    stats["fp"] += float((preds & ~labels).sum().item())
-    stats["fn"] += float((~preds & labels).sum().item())
+class MSSK(nn.Module):
+    def __init__(self, in_channels, out_channels=None, dropout=DROPOUT):
+        super().__init__()
+        if out_channels is None:
+            out_channels = in_channels
+        n = out_channels // 4
+        self.conv1x1 = nn.Conv2d(in_channels, n, kernel_size=1)
+        self.conv3x3 = nn.Conv2d(in_channels, n, kernel_size=3, padding=1)
+        self.conv5x5 = nn.Conv2d(in_channels, n, kernel_size=5, padding=2)
+        self.conv7x7 = nn.Conv2d(in_channels, n, kernel_size=7, padding=3)
+        self.fusion = nn.Conv2d(n * 4, out_channels, kernel_size=1)
+        self.norm = group_norm(out_channels)
+        self.dropout = nn.Dropout2d(dropout)
+        self.relu = nn.ReLU(inplace=True)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = torch.cat([self.conv1x1(x), self.conv3x3(x), self.conv5x5(x), self.conv7x7(x)], dim=1)
+        out = self.dropout(self.norm(self.fusion(out)))
+        return self.relu(out + residual)
 
 
-def summarize_metrics(stats: Dict[str, float]) -> Dict[str, float]:
+class DilateAttention(nn.Module):
+    def __init__(self, in_channel, depth):
+        super().__init__()
+        self.group_norm = group_norm(in_channel)
+        self.relu = nn.ReLU(inplace=True)
+        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1)
+        self.atrous_block2 = nn.Conv2d(in_channel, depth, 3, padding=2, dilation=2)
+        self.atrous_block3 = nn.Conv2d(in_channel, depth, 3, padding=4, dilation=4)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        v = self.atrous_block1(x)
+        q = self.atrous_block2(x)
+        k = self.atrous_block3(x)
+        return v * self.softmax(k * q) + self.relu(self.group_norm(x))
+
+
+class CrackSeg7Band(nn.Module):
+    def __init__(self, in_channels=7, classnum=1, base_dim=BASE_DIM, dropout=DROPOUT):
+        super().__init__()
+        d = base_dim
+        self.relu = nn.ReLU(inplace=True)
+
+        self.enc_conv1 = nn.Conv2d(in_channels, d, kernel_size=7, padding=3)
+        self.enc_gn1 = group_norm(d)
+        self.pool1 = nn.MaxPool2d(2)
+        self.da1 = DilateAttention(d, d)
+        self.drop1 = nn.Dropout2d(dropout)
+
+        self.enc_conv2 = nn.Conv2d(d, d, kernel_size=7, padding=3)
+        self.enc_gn2 = group_norm(d)
+        self.pool2 = nn.MaxPool2d(2)
+        self.da2 = DilateAttention(d, d)
+        self.drop2 = nn.Dropout2d(dropout)
+
+        self.enc_conv3 = nn.Conv2d(d, d, kernel_size=7, padding=3)
+        self.enc_gn3 = group_norm(d)
+        self.pool3 = nn.MaxPool2d(2)
+        self.da3 = DilateAttention(d, d)
+        self.drop3 = nn.Dropout2d(dropout)
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(d, d, kernel_size=7, padding=3),
+            group_norm(d),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+
+        self.up3 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
+        self.mssk1 = MSSK(d * 2, d, dropout)
+        self.up2 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
+        self.mssk2 = MSSK(d * 2, d, dropout)
+        self.up1 = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
+        self.dec_conv1 = nn.Sequential(
+            nn.Conv2d(d, d, kernel_size=3, padding=1),
+            group_norm(d),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+        self.final = nn.Conv2d(d, classnum, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.relu(self.enc_gn1(self.enc_conv1(x)))
+        e1 = self.drop1(self.da1(self.pool1(e1)))
+
+        e2 = self.relu(self.enc_gn2(self.enc_conv2(e1)))
+        e2 = self.drop2(self.da2(self.pool2(e2)))
+
+        e3 = self.relu(self.enc_gn3(self.enc_conv3(e2)))
+        e3 = self.drop3(self.da3(self.pool3(e3)))
+
+        b = self.bottleneck(e3)
+        d3 = self.mssk1(torch.cat([self.up3(b), e2], dim=1))
+        d2 = self.mssk2(torch.cat([self.up2(d3), e1], dim=1))
+        d1 = self.dec_conv1(self.up1(d2))
+        return self.final(d1)
+
+
+class DiceBCEFocalLoss(nn.Module):
+    def __init__(self, pos_weight=POS_WEIGHT):
+        super().__init__()
+        self.register_buffer("pos_weight_tensor", torch.tensor([pos_weight], dtype=torch.float32))
+
+    def forward(self, logits, target):
+        if target.dim() == 4 and target.shape[1] == 1:
+            target = target.squeeze(1)
+        logits_flat = logits.view(-1)
+        target_flat = target.view(-1).float()
+        target_smooth = target_flat * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / 2.0
+
+        probs = torch.sigmoid(logits_flat)
+        bce = F.binary_cross_entropy_with_logits(
+            logits_flat, target_smooth, pos_weight=self.pos_weight_tensor.to(logits.device)
+        )
+        intersection = (probs * target_flat).sum()
+        dice_loss = 1.0 - (2.0 * intersection + 1.0) / (probs.sum() + target_flat.sum() + 1.0)
+
+        p_clamped = torch.clamp(probs, min=1.0e-7, max=1.0 - 1.0e-7)
+        p_t = p_clamped * target_flat + (1.0 - p_clamped) * (1.0 - target_flat)
+        focal_w = (1.0 - p_t) ** FOCAL_GAMMA
+        focal_loss = (
+            focal_w * F.binary_cross_entropy_with_logits(logits_flat, target_smooth, reduction="none")
+        ).mean()
+
+        return BCE_WEIGHT * bce + DICE_WEIGHT * dice_loss + FOCAL_WEIGHT * focal_loss
+
+
+@torch.no_grad()
+def compute_metrics(model, loader, criterion, device, threshold=PRED_THRESHOLD, desc="Eval"):
+    model.eval()
+    total_loss = 0.0
+    batches = 0
+    tp = fp = fn = 0.0
+    for imgs, masks, _ in tqdm(loader, desc=desc, leave=False):
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            out = model(imgs)
+            loss = criterion(out, masks)
+        total_loss += float(loss.item())
+        batches += 1
+        pred = (torch.sigmoid(out) > threshold).long().squeeze(1)
+        labels = (masks > 0.5).long()
+        tp += float(((pred == 1) & (labels == 1)).sum().item())
+        fp += float(((pred == 1) & (labels == 0)).sum().item())
+        fn += float(((pred == 0) & (labels == 1)).sum().item())
+
     eps = 1.0e-7
-    tp, tn, fp, fn = stats["tp"], stats["tn"], stats["fp"], stats["fn"]
-    precision = tp / (tp + fp + eps)
-    recall = tp / (tp + fn + eps)
+    precision = (tp + eps) / (tp + fp + eps)
+    recall = (tp + eps) / (tp + fn + eps)
     f1 = 2.0 * precision * recall / (precision + recall + eps)
-    iou = tp / (tp + fp + fn + eps)
-    bg_iou = tn / (tn + fp + fn + eps)
-    miou = 0.5 * (iou + bg_iou)
-    score = 0.5 * (iou + f1)
-    return {
-        "iou": iou,
-        "miou": miou,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "score": score,
-    }
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    device: torch.device,
-    cfg: Config,
-) -> float:
-    model.train()
-    running_loss = 0.0
-    seen = 0
-    use_amp = cfg.use_amp and device.type == "cuda"
-
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for images, masks, _ in pbar:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, masks)
-
-        scaler.scale(loss).backward()
-        if cfg.grad_clip_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
-
-        batch_size = images.shape[0]
-        running_loss += float(loss.item()) * batch_size
-        seen += batch_size
-        pbar.set_postfix(loss=running_loss / max(seen, 1))
-
-    return running_loss / max(seen, 1)
+    iou = (tp + eps) / (tp + fp + fn + eps)
+    return total_loss / max(batches, 1), {"Precision": precision, "Recall": recall, "F1": f1, "IoU": iou}
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    cfg: Config,
-    desc: str,
-) -> Tuple[float, Dict[str, float]]:
+def search_best_threshold(model, loader, device):
     model.eval()
-    running_loss = 0.0
-    seen = 0
-    stats = empty_metrics()
-    use_amp = cfg.use_amp and device.type == "cuda"
-
-    pbar = tqdm(loader, desc=desc, leave=False)
-    for images, masks, _ in pbar:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, masks)
-        update_confusion(stats, logits.detach(), masks.detach(), cfg.threshold)
-        batch_size = images.shape[0]
-        running_loss += float(loss.item()) * batch_size
-        seen += batch_size
-        pbar.set_postfix(loss=running_loss / max(seen, 1))
-
-    return running_loss / max(seen, 1), summarize_metrics(stats)
-
-
-def normalize_for_display(arr: np.ndarray) -> np.ndarray:
-    arr = np.asarray(arr, dtype=np.float32)
-    lo, hi = np.percentile(arr, [2, 98])
-    if hi <= lo:
-        return np.zeros_like(arr, dtype=np.float32)
-    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-
-
-def nearest_band_index(wavelengths: Sequence[float], target: float) -> int:
-    return int(np.argmin(np.abs(np.asarray(wavelengths, dtype=np.float32) - target)))
-
-
-def make_pseudo_rgb(cube: np.ndarray, cfg: Config) -> np.ndarray:
-    if cube.ndim == 4:
-        cube = cube[0]
-    red_idx = nearest_band_index(cfg.selected_wavelengths, 577.8)
-    green_idx = nearest_band_index(cfg.selected_wavelengths, 532.7)
-    blue_idx = nearest_band_index(cfg.selected_wavelengths, 456.4)
-    rgb = np.stack(
-        [
-            normalize_for_display(cube[red_idx]),
-            normalize_for_display(cube[green_idx]),
-            normalize_for_display(cube[blue_idx]),
-        ],
-        axis=-1,
-    )
-    return rgb
-
-
-@torch.no_grad()
-def save_prediction_figure(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Config, epoch: int) -> None:
-    model.eval()
-    rows: List[Tuple[np.ndarray, np.ndarray, np.ndarray, str]] = []
-    use_amp = cfg.use_amp and device.type == "cuda"
-
-    for images, masks, keys in loader:
-        images_gpu = images.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            logits = model(images_gpu)
-        probs = torch.sigmoid(logits).cpu().numpy()
-        images_np = images.numpy()
+    probs_list = []
+    masks_list = []
+    for imgs, masks, _ in tqdm(loader, desc="Searching threshold", leave=False):
+        imgs = imgs.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            out = model(imgs)
+        probs = torch.sigmoid(out).cpu().numpy()[:, 0]
         masks_np = masks.numpy()
-        for i in range(images_np.shape[0]):
-            rgb = make_pseudo_rgb(images_np[i], cfg)
-            truth = masks_np[i, 0]
-            pred = (probs[i, 0] >= cfg.threshold).astype(np.float32)
-            rows.append((rgb, truth, pred, str(keys[i])))
-            if len(rows) >= cfg.prediction_samples:
-                break
-        if len(rows) >= cfg.prediction_samples:
-            break
+        for i in range(probs.shape[0]):
+            probs_list.append(probs[i])
+            masks_list.append(masks_np[i])
 
-    if not rows:
+    best_thr = PRED_THRESHOLD
+    best_iou = -1.0
+    for thr in np.arange(0.35, 0.76, 0.05):
+        tp = fp = fn = 0.0
+        for prob, mask in zip(probs_list, masks_list):
+            pred = prob > thr
+            label = mask > 0.5
+            tp += float((pred & label).sum())
+            fp += float((pred & ~label).sum())
+            fn += float((~pred & label).sum())
+        iou = (tp + 1.0e-7) / (tp + fp + fn + 1.0e-7)
+        if iou > best_iou:
+            best_iou = iou
+            best_thr = float(thr)
+    return best_thr, best_iou
+
+
+def save_prediction_figure(model, dataset, device, save_path, epoch, indices, band_idx, threshold):
+    model.eval()
+    indices = [idx for idx in indices if idx < len(dataset)]
+    if not indices:
         return
-
-    fig, axes = plt.subplots(len(rows), 3, figsize=(10, 3.2 * len(rows)))
-    if len(rows) == 1:
-        axes = np.expand_dims(axes, axis=0)
-
-    for row_idx, (rgb, truth, pred, key) in enumerate(rows):
-        axes[row_idx, 0].imshow(rgb)
-        axes[row_idx, 0].set_title(f"Input\n{key}", fontsize=8)
-        axes[row_idx, 1].imshow(truth, cmap="gray", vmin=0, vmax=1)
-        axes[row_idx, 1].set_title("Ground Truth", fontsize=8)
-        axes[row_idx, 2].imshow(pred, cmap="gray", vmin=0, vmax=1)
-        axes[row_idx, 2].set_title("Prediction", fontsize=8)
-        for col in range(3):
-            axes[row_idx, col].axis("off")
-
-    fig.tight_layout()
-    out_path = cfg.prediction_dir / f"predictions_epoch_{epoch}.png"
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig, axes = plt.subplots(len(indices), 3, figsize=(15, 5 * len(indices)))
+    if len(indices) == 1:
+        axes = axes[np.newaxis, :]
+    with torch.no_grad():
+        for row, idx in enumerate(indices):
+            img, mask, key = dataset[idx]
+            inp = img.unsqueeze(0).to(device)
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                out = model(inp)
+            pred = (torch.sigmoid(out).squeeze().cpu().numpy() > threshold).astype(np.float32)
+            b = min(band_idx, img.shape[0] - 1)
+            band = img[b].numpy()
+            lo, hi = np.percentile(band, [2, 98])
+            band = np.clip((band - lo) / max(hi - lo, 1.0e-6), 0.0, 1.0)
+            axes[row, 0].imshow(band, cmap="gray")
+            axes[row, 0].set_title(f"{key}\nBand {b} ({BAND_NAMES[b]})", fontsize=8)
+            axes[row, 1].imshow(mask.numpy(), cmap="gray", vmin=0, vmax=1)
+            axes[row, 1].set_title("Ground Truth")
+            axes[row, 2].imshow(pred, cmap="gray", vmin=0, vmax=1)
+            axes[row, 2].set_title("Prediction")
+            for col in range(3):
+                axes[row, col].axis("off")
+    plt.suptitle(f"Epoch {epoch}, threshold={threshold:.2f}", fontsize=14)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
-def append_metrics_log(path: Path, history: List[Dict[str, float]]) -> None:
-    header = [
-        "epoch",
-        "train_loss",
-        "val_loss",
-        "iou",
-        "miou",
-        "precision",
-        "recall",
-        "f1",
-        "score",
-        "lr",
-    ]
-    with path.open("w", encoding="utf-8") as f:
-        f.write("\t".join(header) + "\n")
-        for row in history:
-            f.write(
-                "\t".join(
-                    [
-                        str(int(row["epoch"])),
-                        f"{row['train_loss']:.8f}",
-                        f"{row['val_loss']:.8f}",
-                        f"{row['iou']:.8f}",
-                        f"{row['miou']:.8f}",
-                        f"{row['precision']:.8f}",
-                        f"{row['recall']:.8f}",
-                        f"{row['f1']:.8f}",
-                        f"{row['score']:.8f}",
-                        f"{row['lr']:.10f}",
-                    ]
-                )
-                + "\n"
-            )
+class TrainingLogger:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.h = {
+            "train_loss": [],
+            "val_loss": [],
+            "iou": [],
+            "f1": [],
+            "precision": [],
+            "recall": [],
+            "lr": [],
+            "threshold": [],
+        }
+
+    def log(self, tl, vl, metrics, lr, threshold):
+        self.h["train_loss"].append(float(tl))
+        self.h["val_loss"].append(float(vl))
+        self.h["iou"].append(float(metrics["IoU"]))
+        self.h["f1"].append(float(metrics["F1"]))
+        self.h["precision"].append(float(metrics["Precision"]))
+        self.h["recall"].append(float(metrics["Recall"]))
+        self.h["lr"].append(float(lr))
+        self.h["threshold"].append(float(threshold))
+        with self.path.open("w", encoding="utf-8") as f:
+            json.dump(self.h, f, indent=2)
+
+    def plot(self, path):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes[0, 0].plot(self.h["train_loss"], label="Train")
+        axes[0, 0].plot(self.h["val_loss"], label="Val")
+        axes[0, 0].set_title("Loss")
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        axes[0, 1].plot(self.h["iou"], label="IoU")
+        axes[0, 1].plot(self.h["f1"], label="F1")
+        axes[0, 1].set_title("Metrics at Fixed Threshold")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        axes[1, 0].plot(self.h["precision"], label="Precision")
+        axes[1, 0].plot(self.h["recall"], label="Recall")
+        axes[1, 0].set_title("Precision / Recall")
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        axes[1, 1].plot(self.h["lr"], label="LR", color="red")
+        axes[1, 1].set_title("Learning Rate")
+        axes[1, 1].set_yscale("log")
+        axes[1, 1].grid(True, alpha=0.3)
+
+        axes[0, 2].plot(self.h["threshold"], label="Threshold", color="green")
+        axes[0, 2].set_title("Training Threshold")
+        axes[0, 2].grid(True, alpha=0.3)
+        axes[1, 2].axis("off")
+        plt.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
 
 
-def save_all_curves(history: List[Dict[str, float]], cfg: Config) -> None:
-    if not history:
-        return
-    epochs = [int(row["epoch"]) for row in history]
-
-    def values(name: str) -> List[float]:
-        return [float(row[name]) for row in history]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values("train_loss"), label="Train Loss", linewidth=1.8)
-    ax.plot(epochs, values("val_loss"), label="Validation Loss", linewidth=1.8)
-    ax.set_title("Train Loss / Validation Loss")
-    ax.set_xlabel("Epoch")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(cfg.figure_dir / "loss_curve.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values("iou"), label="IoU", linewidth=1.8)
-    ax.plot(epochs, values("f1"), label="F1", linewidth=1.8)
-    ax.plot(epochs, values("score"), label="Score", linewidth=1.8)
-    ax.set_title("IoU / F1 / Score")
-    ax.set_xlabel("Epoch")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(cfg.figure_dir / "iou_f1_score_curve.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values("precision"), label="Precision", linewidth=1.8)
-    ax.plot(epochs, values("recall"), label="Recall", linewidth=1.8)
-    ax.set_title("Precision / Recall")
-    ax.set_xlabel("Epoch")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(cfg.figure_dir / "precision_recall_curve.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, values("lr"), label="Learning Rate", linewidth=1.8)
-    ax.set_title("Learning Rate")
-    ax.set_xlabel("Epoch")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(cfg.figure_dir / "lr_curve.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def config_for_save(cfg: Config) -> Dict[str, object]:
-    data = asdict(cfg)
-    for key, value in list(data.items()):
-        if isinstance(value, Path):
-            data[key] = str(value)
-        elif isinstance(value, tuple):
-            data[key] = list(value)
-    return data
-
-
-def save_config(path: Path, cfg: Config) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(config_for_save(cfg), f, ensure_ascii=False, indent=2)
-
-
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    epoch: int,
-    best_score: float,
-    history: List[Dict[str, float]],
-    cfg: Config,
-) -> None:
-    torch.save(
-        {
-            "epoch": epoch,
-            "best_score": best_score,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "history": history,
-            "config": config_for_save(cfg),
-        },
-        path,
-    )
-
-
-def load_checkpoint_if_available(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    cfg: Config,
-    device: torch.device,
-    fresh: bool,
-) -> Tuple[int, float, List[Dict[str, float]]]:
-    if fresh or not cfg.last_checkpoint_path.is_file():
-        return 0, -1.0, []
-    checkpoint = torch.load(cfg.last_checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
-    optimizer.load_state_dict(checkpoint["optimizer_state"])
-    if checkpoint.get("scaler_state"):
-        scaler.load_state_dict(checkpoint["scaler_state"])
-    start_epoch = int(checkpoint.get("epoch", 0))
-    best_score = float(checkpoint.get("best_score", -1.0))
-    history = list(checkpoint.get("history", []))
-    print(f"Resumed from {cfg.last_checkpoint_path} at epoch {start_epoch}, best_score={best_score:.6f}")
-    return start_epoch, best_score, history
-
-
-def make_loader(dataset: Dataset, cfg: Config, shuffle: bool, generator: torch.Generator | None = None) -> DataLoader:
+def make_loader(dataset, shuffle, generator=None, drop_last=False):
     return DataLoader(
         dataset,
-        batch_size=cfg.batch_size,
+        batch_size=BATCH_SIZE,
         shuffle=shuffle,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory and torch.cuda.is_available(),
-        worker_init_fn=seed_worker if cfg.num_workers > 0 else None,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker if NUM_WORKERS > 0 else None,
         generator=generator,
-        persistent_workers=cfg.num_workers > 0,
+        drop_last=drop_last,
+        persistent_workers=NUM_WORKERS > 0,
     )
 
 
-def write_final_test_metrics(path: Path, test_loss: float, metrics: Dict[str, float]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        f.write(f"test_loss\t{test_loss:.8f}\n")
-        for key in ["iou", "miou", "precision", "recall", "f1", "score"]:
-            f.write(f"{key}\t{metrics[key]:.8f}\n")
+def save_json(path, obj):
+    with Path(path).open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def print_dataset_summary(
-    train_pairs: Sequence[Tuple[str, Path, Path]],
-    val_pairs: Sequence[Tuple[str, Path, Path]],
-    test_pairs: Sequence[Tuple[str, Path, Path]],
-    cfg: Config,
-) -> None:
-    train_keys = {key for key, _, _ in train_pairs}
-    val_keys = {key for key, _, _ in val_pairs}
-    test_keys = {key for key, _, _ in test_pairs}
-    train_test_overlap = (train_keys | val_keys) & test_keys
-    train_val_overlap = train_keys & val_keys
-    print("=" * 72)
-    print("Dataset summary")
-    print(f"Selected wavelengths (nm): {', '.join(str(v) for v in cfg.selected_wavelengths)}")
-    print(f"Train samples: {len(train_pairs)}")
-    print(f"Val samples:   {len(val_pairs)}")
-    print(f"Test samples:  {len(test_pairs)}")
-    print(f"Train/Val overlap:  {len(train_val_overlap)}")
-    print(f"Train+Val/Test overlap: {len(train_test_overlap)}")
-    print("=" * 72)
-    if train_val_overlap:
-        raise RuntimeError(f"Train/val leakage detected: {sorted(train_val_overlap)[:5]}")
-    if train_test_overlap:
-        raise RuntimeError(f"Train/test leakage detected: {sorted(train_test_overlap)[:5]}")
+def main():
+    set_seed(SEED)
+    ensure_dirs()
 
+    train_pairs = pair_files(TRAIN_IMG_DIR, TRAIN_MASK_DIR)
+    train_indices, val_indices = grouped_split(train_pairs, VAL_RATIO, SEED)
+    train_keys = {train_pairs[i][0] for i in train_indices}
+    val_keys = {train_pairs[i][0] for i in val_indices}
+    if train_keys & val_keys:
+        raise RuntimeError("Train/val split leakage detected")
 
-def main() -> None:
-    args = parse_args()
-    cfg = CFG
-    apply_args(cfg, args)
-    resolve_dataset_paths(cfg)
-    ensure_dirs(cfg)
-    save_config(cfg.log_dir / "config.json", cfg)
-    set_seed(cfg.seed)
+    band_mean, band_std = compute_band_stats(train_pairs, train_indices)
+    pos_weight = compute_pos_weight(train_pairs, train_indices) if AUTO_POS_WEIGHT else POS_WEIGHT
+
+    base_dataset = CrackDataset(train_pairs, augment=False, band_mean=band_mean, band_std=band_std)
+    train_ds = Subset(base_dataset, train_indices)
+    val_ds = Subset(base_dataset, val_indices)
+
+    test_loader = None
+    if TEST_IMG_DIR.is_dir() and TEST_MASK_DIR.is_dir():
+        test_pairs = pair_files(TEST_IMG_DIR, TEST_MASK_DIR)
+        test_dataset = CrackDataset(test_pairs, augment=False, band_mean=band_mean, band_std=band_std)
+        test_loader = make_loader(test_dataset, shuffle=False)
+        train_val_keys = train_keys | val_keys
+        test_keys = {key for key, _, _ in test_pairs}
+        if train_val_keys & test_keys:
+            raise RuntimeError("Train/test split leakage detected")
+    else:
+        test_pairs = []
+
+    generator = torch.Generator()
+    generator.manual_seed(SEED)
+    train_loader = make_loader(train_ds, shuffle=True, generator=generator, drop_last=False)
+    val_loader = make_loader(val_ds, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA: {torch.cuda.get_device_name(0)}")
 
-    all_train_pairs = pair_files(cfg.train_img_dir, cfg.train_mask_dir)
-    test_pairs = pair_files(cfg.test_img_dir, cfg.test_mask_dir)
-    validate_shapes(all_train_pairs, cfg, "train/val")
-    validate_shapes(test_pairs, cfg, "test")
+    model = CrackSeg7Band(in_channels=IN_CHANNELS, classnum=1, base_dim=BASE_DIM, dropout=DROPOUT).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    print(f"Train/Val/Test samples: {len(train_indices)}/{len(val_indices)}/{len(test_pairs)}")
+    print(f"Band mean: {band_mean.tolist()}")
+    print(f"Band std:  {band_std.tolist()}")
+    print(f"pos_weight: {pos_weight:.4f}")
 
-    train_pairs, val_pairs = split_train_val(all_train_pairs, cfg.val_ratio, cfg.seed)
-    print_dataset_summary(train_pairs, val_pairs, test_pairs, cfg)
-
-    generator = torch.Generator()
-    generator.manual_seed(cfg.seed)
-
-    train_dataset = CrackNpyDataset(train_pairs, cfg, augment=True)
-    val_dataset = CrackNpyDataset(val_pairs, cfg, augment=False)
-    test_dataset = CrackNpyDataset(test_pairs, cfg, augment=False)
-
-    train_loader = make_loader(train_dataset, cfg, shuffle=True, generator=generator)
-    val_loader = make_loader(val_dataset, cfg, shuffle=False)
-    test_loader = make_loader(test_dataset, cfg, shuffle=False)
-
-    pos_weight_value = compute_pos_weight(train_pairs, cfg)
-    print(f"Using pos_weight={pos_weight_value:.4f}")
-    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
-
-    model = MScrackSeg7(in_channel=1, classnum=1, num_bands=cfg.num_bands).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp and device.type == "cuda")
-    criterion = CombinedLoss(pos_weight=pos_weight, dice_weight=cfg.dice_loss_weight)
-
-    start_epoch, best_score, history = load_checkpoint_if_available(
-        model, optimizer, scaler, cfg, device, fresh=args.fresh
+    criterion = DiceBCEFocalLoss(pos_weight=pos_weight).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        epochs=EPOCHS,
+        steps_per_epoch=max(len(train_loader), 1),
+        pct_start=0.08,
+        div_factor=10,
+        final_div_factor=50,
     )
-    metrics_log_path = cfg.log_dir / "metrics_log.txt"
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    ema = EMA(model, EMA_DECAY)
 
-    for epoch in range(start_epoch + 1, cfg.epochs + 1):
-        lr = learning_rate_for_epoch(epoch, cfg)
-        set_optimizer_lr(optimizer, lr)
+    start_epoch = 0
+    best_iou = -1.0
+    best_epoch = 0
+    trigger = 0
+    logger = TrainingLogger(TRAIN_LOG)
 
-        print(f"\nEpoch {epoch}/{cfg.epochs} | lr={lr:.8f}")
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, cfg)
-        val_loss, val_metrics = evaluate(model, val_loader, criterion, device, cfg, desc="Validate")
+    if RESUME_TRAINING and LATEST_CHECKPOINT.exists():
+        checkpoint = torch.load(LATEST_CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        ema.shadow = {k: v.to(device) for k, v in checkpoint["ema_shadow"].items()}
+        start_epoch = int(checkpoint["epoch"])
+        best_iou = float(checkpoint.get("best_iou", -1.0))
+        best_epoch = int(checkpoint.get("best_epoch", 0))
+        trigger = int(checkpoint.get("trigger", 0))
+        logger.h = checkpoint.get("history", logger.h)
+        print(f"Resumed from epoch {start_epoch}, best_iou={best_iou:.4f}")
 
-        row = {
-            "epoch": float(epoch),
-            "train_loss": float(train_loss),
-            "val_loss": float(val_loss),
-            "lr": float(lr),
-            **{k: float(v) for k, v in val_metrics.items()},
-        }
-        history.append(row)
+    config = {
+        "data_dir": str(DEFAULT_DATA),
+        "output_root": str(OUTPUT_ROOT),
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "patience": PATIENCE,
+        "base_dim": BASE_DIM,
+        "dropout": DROPOUT,
+        "mixup_alpha": MIXUP_ALPHA,
+        "band_drop_prob": BAND_DROP_PROB,
+        "ema_decay": EMA_DECAY,
+        "val_ratio": VAL_RATIO,
+        "spatial_group_size": SPATIAL_GROUP_SIZE,
+        "pos_weight": pos_weight,
+        "band_mean": band_mean.tolist(),
+        "band_std": band_std.tolist(),
+        "train_count": len(train_indices),
+        "val_count": len(val_indices),
+        "test_count": len(test_pairs),
+    }
+    save_json(OUTPUT_ROOT / "config_7band_generalized.json", config)
+
+    for epoch in range(start_epoch, EPOCHS):
+        ep = epoch + 1
+        base_dataset.augment = True
+        model.train()
+        train_loss = 0.0
+        batches = 0
+
+        for imgs, masks, _ in tqdm(train_loader, desc=f"Epoch {ep:03d}"):
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            if MIXUP_ALPHA > 0 and random.random() < 0.20 and imgs.size(0) > 1:
+                lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                perm = torch.randperm(imgs.size(0), device=device)
+                imgs = lam * imgs + (1.0 - lam) * imgs[perm]
+                masks = lam * masks + (1.0 - lam) * masks[perm]
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                out = model(imgs)
+                loss = criterion(out, masks)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            ema.update()
+
+            train_loss += float(loss.item())
+            batches += 1
+
+        if batches == 0:
+            continue
+
+        base_dataset.augment = False
+        ema.apply_shadow()
+        val_loss, metrics = compute_metrics(model, val_loader, criterion, device, PRED_THRESHOLD, desc="Validate")
+        ema.restore()
+
+        avg_train_loss = train_loss / batches
+        lr = optimizer.param_groups[0]["lr"]
+        logger.log(avg_train_loss, val_loss, metrics, lr, PRED_THRESHOLD)
+
+        improved = metrics["IoU"] > best_iou + MIN_DELTA
+        if improved:
+            best_iou = metrics["IoU"]
+            best_epoch = ep
+            trigger = 0
+            ema.apply_shadow()
+            torch.save(model.state_dict(), CHECKPOINT)
+            ema.restore()
+            msg = " >>> Best fixed-threshold IoU"
+        else:
+            trigger += 1
+            msg = f" Wait({trigger}/{PATIENCE})"
+
+        torch.save(
+            {
+                "epoch": ep,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "ema_shadow": ema.shadow,
+                "best_iou": best_iou,
+                "best_epoch": best_epoch,
+                "trigger": trigger,
+                "history": logger.h,
+                "config": config,
+            },
+            LATEST_CHECKPOINT,
+        )
 
         print(
-            "Train Loss={train_loss:.6f} | Val Loss={val_loss:.6f} | "
-            "IoU={iou:.4f} mIoU={miou:.4f} F1={f1:.4f} "
-            "Precision={precision:.4f} Recall={recall:.4f} Score={score:.4f}".format(
-                train_loss=train_loss, val_loss=val_loss, **val_metrics
-            )
+            f"Ep{ep:03d} | Tr:{avg_train_loss:.4f} Va:{val_loss:.4f} | "
+            f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} | "
+            f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} | "
+            f"Thr:{PRED_THRESHOLD:.2f} LR:{lr:.2e}{msg}"
         )
 
-        append_metrics_log(metrics_log_path, history)
-        save_checkpoint(cfg.last_checkpoint_path, model, optimizer, scaler, epoch, best_score, history, cfg)
-
-        if val_metrics["score"] > best_score:
-            best_score = float(val_metrics["score"])
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "best_score": best_score,
-                    "model_state": model.state_dict(),
-                    "config": config_for_save(cfg),
-                },
-                cfg.best_model_path,
+        if ep % VIZ_EVERY == 0:
+            ema.apply_shadow()
+            save_prediction_figure(
+                model,
+                val_ds,
+                device,
+                OUTPUT_ROOT / "viz" / f"viz_ep{ep:03d}.png",
+                ep,
+                VIZ_SAMPLE_INDICES,
+                VIZ_BAND_IDX,
+                PRED_THRESHOLD,
             )
-            save_checkpoint(cfg.last_checkpoint_path, model, optimizer, scaler, epoch, best_score, history, cfg)
-            print(f"Saved new best model to {cfg.best_model_path} (score={best_score:.6f})")
+            ema.restore()
 
-        if epoch % cfg.prediction_interval == 0 or epoch == cfg.epochs:
-            save_prediction_figure(model, val_loader, device, cfg, epoch)
+        if trigger >= PATIENCE:
+            print(f"Early stopping: no validation IoU improvement for {PATIENCE} epochs")
+            break
 
-    save_all_curves(history, cfg)
+    logger.plot(OUTPUT_ROOT / "training_curves_7band_generalized.png")
 
-    if cfg.best_model_path.is_file():
-        best_checkpoint = torch.load(cfg.best_model_path, map_location=device)
-        model.load_state_dict(best_checkpoint["model_state"])
-        print(f"\nLoaded best model from epoch {best_checkpoint.get('epoch', 'unknown')}")
-    else:
-        print("\nBest model file was not found; evaluating current model.")
+    if CHECKPOINT.exists():
+        model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
+        print(f"Loaded best model from epoch {best_epoch}, fixed-threshold val IoU={best_iou:.4f}")
 
-    test_loss, test_metrics = evaluate(model, test_loader, criterion, device, cfg, desc="Final Test")
-    write_final_test_metrics(cfg.log_dir / "final_test_metrics.txt", test_loss, test_metrics)
-    print(
-        "Final Test | Loss={loss:.6f} | IoU={iou:.4f} mIoU={miou:.4f} F1={f1:.4f} "
-        "Precision={precision:.4f} Recall={recall:.4f} Score={score:.4f}".format(
-            loss=test_loss, **test_metrics
+    best_threshold, val_search_iou = search_best_threshold(model, val_loader, device)
+    val_loss, val_metrics = compute_metrics(model, val_loader, criterion, device, best_threshold, desc="Final Val")
+
+    results = {
+        "best_epoch": best_epoch,
+        "fixed_threshold": PRED_THRESHOLD,
+        "selected_threshold": best_threshold,
+        "val_threshold_search_iou": val_search_iou,
+        "final_val_loss": val_loss,
+        "final_val_metrics": val_metrics,
+    }
+
+    if test_loader is not None:
+        test_loss, test_metrics = compute_metrics(model, test_loader, criterion, device, best_threshold, desc="Final Test")
+        results["final_test_loss"] = test_loss
+        results["final_test_metrics"] = test_metrics
+        print(
+            f"Final Test | Loss:{test_loss:.4f} IoU:{test_metrics['IoU']:.4f} "
+            f"F1:{test_metrics['F1']:.4f} Prec:{test_metrics['Precision']:.4f} "
+            f"Rec:{test_metrics['Recall']:.4f} Thr:{best_threshold:.2f}"
         )
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "selected_threshold": best_threshold,
+            "band_mean": band_mean,
+            "band_std": band_std,
+            "config": config,
+            "results": results,
+        },
+        MODEL_DIR / "7band_best_model_with_preprocess.pth",
     )
-    print(f"All outputs saved under: {cfg.output_dir}")
+    save_json(FINAL_METRICS, results)
+
+    print("=" * 60)
+    print(f"Training finished. Outputs: {OUTPUT_ROOT}")
+    print(f"Best state_dict: {CHECKPOINT}")
+    print(f"Model package with preprocessing: {MODEL_DIR / '7band_best_model_with_preprocess.pth'}")
+    print(f"Final metrics: {FINAL_METRICS}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user.", file=sys.stderr)
-        raise
+    main()
