@@ -1,93 +1,133 @@
 #!/usr/bin/env python3
 """
-MS-CrackSeg 7波段精简版 (适配本地 RTX 2080 8GB + Windows)
-==========================================================
-基于 7波段3090版 修改, 针对 RTX 2080 (8GB显存) 做以下调整:
+MS-CrackSeg 7 波段训练脚本 v5
+=================================
 
-★ 相比3090版的参数调整 (共5处) ★
+适用场景：
+1. 输入是 7 个筛选后的高光谱波段 `.npy` 数组。
+2. 任务是混凝土裂缝二分类分割。
+3. 需要在 AutoDL / RTX3090 环境中稳定训练。
 
-调整1  [路径]        路径改为本地 D 盘 7selectband 目录
-调整2  [BASE_DIM]    32 → 16 (模型通道数减半, 参数量降为约1/4, 显存大幅降低)
-调整3  [BATCH_SIZE]  16 → 4  (8GB显存安全值, 若不报OOM可试改为6或8)
-调整4  [LEARNING_RATE] 1e-3 → 2e-4 (batch变小, 按线性缩放降低LR以保持稳定)
-调整5  [NUM_WORKERS] 8 → 0  (Windows多进程极易报错, 设0禁用多进程, 略慢但稳定)
-      [persistent_workers] True → False (Windows下必须关闭, 否则报错)
+本脚本提供：
+1. 自动匹配 [`reduction_band/7selectband/img`](reduction_band/7selectband/img) 与
+   [`reduction_band/7selectband/masknpy`](reduction_band/7selectband/masknpy) 中命名略有不同的文件。
+2. 每个 epoch 保存 train loss、val loss、IoU、F1、Precision、Recall、LR 到 JSON。
+3. 自动保存最佳模型 [`7band_best_model.pth`](reduction_band/7bandtrain5.py:121) 与最新断点，支持断点续训。
+4. 自动绘制训练曲线，便于观察是否过拟合。
+5. 在模型选择时兼顾 Precision / Recall 平衡，而不是只盯 IoU。
 """
 
 import os
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+
+import copy
+import json
+import math
 import random
+import re
+from dataclasses import dataclass, asdict
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import matplotlib
-matplotlib.use("Agg")  # 无GUI后端, 避免弹窗报错
-import matplotlib.pyplot as plt
-import json
+
 
 # ================================================================
-# 1. 路径与超参数
+# 1. 配置
 # ================================================================
+@dataclass
+class Config:
+    # 数据路径：优先使用当前工程相对路径，若不存在则回退到 Linux 路径
+    workspace_data_root: str = os.path.join("reduction_band", "7selectband")
+    linux_data_root: str = r"/root/autodl-tmp/reduction_band/7selectband"
 
-# --- [调整1] 数据路径: 改为本地 D 盘 7波段数据目录 ---
-#    (请确认这个路径与你预处理脚本输出的路径一致)
-_DEFAULT_DATA = r"D:\deeplearning\MS-CrackSeg-main\reduction_band\7selectband"
-train_img_dir  = os.path.join(_DEFAULT_DATA, "img")
-train_mask_dir = os.path.join(_DEFAULT_DATA, "masknpy")
+    output_root_win: str = os.path.join("reduction_band", "output_results_7band", "output5")
+    output_root_linux: str = r"/root/autodl-tmp/reduction_band/output_results_7band/output5"
 
-# 输出目录也改到本地
-OUTPUT_ROOT  = r"D:\deeplearning\MS-CrackSeg-main\reduction_band/output_results_7band"
-MODEL_DIR    = os.path.join(OUTPUT_ROOT, "models")
-TRAIN_LOG    = os.path.join(OUTPUT_ROOT, "training_log_7band.json")
-CHECKPOINT   = os.path.join(MODEL_DIR, "best_model.pth")
+    in_channels: int = 7
+    epochs: int = 180
+    batch_size: int = 12
+    lr: float = 2.5e-4
+    min_lr: float = 8e-7
+    warmup_epochs: int = 8
+    weight_decay: float = 1e-4
+    patience: int = 24
+    num_workers: int = 0
+    grad_clip: float = 1.0
+    seed: int = 42
 
-IN_CHANNELS  = 7       # 7个最优波段
-EPOCHS       = 300
+    train_ratio: float = 0.75
+    val_ratio_within_trainval: float = 0.20
+    base_dim: int = 32
+    dropout: float = 0.18
+    ema_decay: float = 0.998
 
-# --- [调整3] 批大小: 16 → 4 ---
-#    RTX 2080 显存 8GB, 2D模型+混合精度, batch=4 约占 3~4GB, 安全
-#    如果训练过程中没有 OOM(显存溢出), 可以尝试改为 6 或 8 加速训练
-BATCH_SIZE   = 4
+    # 旧版本正样本惩罚过强，导致 recall 高、precision 低
+    pos_weight: float = 2.2
+    bce_weight: float = 0.24
+    tversky_weight: float = 0.36
+    focal_weight: float = 0.18
+    hard_negative_weight: float = 0.12
+    background_weight: float = 0.10
+    focal_gamma: float = 2.0
+    tversky_alpha: float = 0.62   # 保持对 FP 的惩罚，但不过度压制召回
+    tversky_beta: float = 0.38
+    label_smoothing: float = 0.01
+    hard_negative_ratio: float = 0.05
+    empty_mask_loss_scale: float = 1.20
 
-# --- [调整4] 学习率: 1e-3 → 2e-4 ---
-#    经验规则: batch 缩小几倍, LR 也缩小几倍 (16→4 缩4倍, 1e-3→2.5e-4, 取2e-4)
-LEARNING_RATE = 2e-4
+    mixup_alpha: float = 0.0      # 分割任务中对细裂缝会模糊边界，默认关闭
+    band_drop_prob: float = 0.15
+    band_noise_prob: float = 0.25
+    cutout_prob: float = 0.25
+    cutout_size: int = 20
 
-WEIGHT_DECAY = 1e-4
-PATIENCE     = 50
+    threshold_candidates: tuple = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
+    min_precision_floor: float = 0.55
+    default_threshold: float = 0.55
 
-# --- [调整5] 工作线程: 8 → 0 ---
-#    Windows 系统下 DataLoader 的多进程 (num_workers>0) 经常因
-#    pickle 序列化问题报错, 设为 0 表示主进程加载数据, 速度略慢但不会崩
-NUM_WORKERS  = 0
-
-VIZ_BAND_IDX = 3       # 可视化显示第4个波段 (577.8nm, 黄绿光)
-PRED_THRESHOLD = 0.22
-VIZ_EVERY    = 30
-VIZ_SAMPLE_INDICES = [0, 1, 2]
-GRAD_CLIP    = 1.0
-AUG_PROB     = 0.5
-SEED         = 42
-
-POS_WEIGHT   = 80.0
-DICE_WEIGHT  = 0.35
-BCE_WEIGHT   = 0.35
-FOCAL_WEIGHT = 0.30
-FOCAL_GAMMA  = 2.5
-
-# --- [调整2] 模型基础通道数: 32 → 16 ---
-#    这是控制模型大小最关键的参数:
-#    BASE_DIM=32 → 参数量约 40万, 显存约 5~6GB (batch=4时可能OOM)
-#    BASE_DIM=16 → 参数量约 10万, 显存约 2~3GB (batch=4 稳定运行)
-#    如果 batch=4 训练正常且显存有富余, 可以改回 32 提升精度
-BASE_DIM = 16
+    viz_every: int = 0
+    viz_band_idx: int = 3
+    viz_sample_count: int = 3
 
 
-def set_seed(seed=SEED):
-    """固定随机种子, 保证每次运行结果一致"""
+CFG = Config()
+
+
+def resolve_data_root():
+    if os.path.isdir(CFG.workspace_data_root):
+        return CFG.workspace_data_root
+    return CFG.linux_data_root
+
+
+def resolve_output_root():
+    if os.name == 'nt':
+        return CFG.output_root_win
+    return CFG.output_root_linux
+
+
+DATA_ROOT = resolve_data_root()
+IMG_DIR = os.path.join(DATA_ROOT, "img")
+MASK_DIR = os.path.join(DATA_ROOT, "masknpy")
+OUTPUT_ROOT = resolve_output_root()
+MODEL_DIR = os.path.join(OUTPUT_ROOT, "models")
+TRAIN_LOG = os.path.join(OUTPUT_ROOT, "training_metrics_7band.json")
+CONFIG_PATH = os.path.join(OUTPUT_ROOT, "training_config_7band_v5.json")
+CHECKPOINT = os.path.join(MODEL_DIR, "7band_best_model.pth")
+LATEST_CHECKPOINT = os.path.join(MODEL_DIR, "latest_checkpoint_7band.pth")
+
+
+# ================================================================
+# 2. 基础工具
+# ================================================================
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -96,575 +136,838 @@ def set_seed(seed=SEED):
     torch.backends.cudnn.benchmark = False
 
 
+def ensure_dirs():
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+
+def save_config():
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(asdict(CFG), f, indent=2, ensure_ascii=False)
+
+
+def extract_key(filename: str) -> str:
+    stem = filename.replace('.npy', '')
+    m = re.search(r'r\dc\d+col\d+row\d+', stem)
+    if m:
+        return m.group()
+    m = re.search(r'col\d+row\d+', stem)
+    if m:
+        return m.group()
+    return stem
+
+
+def extract_group_id(key: str) -> str:
+    """
+    用于按场景分组切分，减少相邻切块同时落入训练/验证集导致的指标泄漏。
+    优先提取 r?c? 作为分组；若无法提取，再退化为去除 row/col 细粒度位置。
+    """
+    m = re.search(r'(r\dc\d+)', key)
+    if m:
+        return m.group(1)
+    key2 = re.sub(r'col\d+', 'colX', key)
+    key2 = re.sub(r'row\d+', 'rowY', key2)
+    return key2
+
+
+def beta_mixup(imgs, masks, alpha, device):
+    if alpha <= 0 or imgs.size(0) < 2:
+        return imgs, masks
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(imgs.size(0), device=device)
+    mixed_imgs = lam * imgs + (1.0 - lam) * imgs[perm]
+    mixed_masks = lam * masks + (1.0 - lam) * masks[perm]
+    return mixed_imgs, mixed_masks
+
+
+def compute_balance_score(metrics):
+    """
+    模型保存分数：
+    - IoU / F1 仍然重要；
+    - Precision / Recall 都参与；
+    - 额外惩罚 Precision 与 Recall 差距过大，避免一高一低。
+    """
+    precision = float(metrics['Precision'])
+    recall = float(metrics['Recall'])
+    f1 = float(metrics['F1'])
+    iou = float(metrics['IoU'])
+    balance_penalty = abs(precision - recall)
+    score = 0.40 * iou + 0.30 * f1 + 0.15 * precision + 0.15 * recall - 0.10 * balance_penalty
+    return score
+
+
 # ================================================================
-# 2. 多尺度空间卷积(MSSK)模块 (2D版本)
+# 3. EMA
+# ================================================================
+class EMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name].clone()
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+# ================================================================
+# 4. 模型定义
 # ================================================================
 class MSSK(nn.Module):
-    """
-    多尺度空间卷积模块
-    并行 1×1, 3×3, 5×5, 7×7 四个分支 → 拼接 → 1×1融合 → 残差连接
-    专门针对细长裂缝设计, 不同尺度卷积捕获不同粗细的裂缝特征
-    """
-    def __init__(self, in_channels, out_channels=None):
+    def __init__(self, in_channels, out_channels=None, dropout=0.18):
         super().__init__()
-        if out_channels is None:
-            out_channels = in_channels
-
-        n = out_channels // 4  # 每个分支分到的通道数
-
-        # 四个尺度的卷积分支
-        self.conv1x1 = nn.Conv2d(in_channels, n, kernel_size=1, padding=0)
-        self.conv3x3 = nn.Conv2d(in_channels, n, kernel_size=3, padding=1)
-        self.conv5x5 = nn.Conv2d(in_channels, n, kernel_size=5, padding=2)
-        self.conv7x7 = nn.Conv2d(in_channels, n, kernel_size=7, padding=3)
-
-        # 融合层: 把4个分支的输出拼起来 (共n*4通道) → 压缩回 out_channels
-        self.fusion = nn.Conv2d(n * 4, out_channels, kernel_size=1)
-        self.bn     = nn.BatchNorm2d(out_channels)
-        self.relu   = nn.ReLU(inplace=True)
-
-        # 残差连接: 如果输入输出通道数不同, 用1×1卷积对齐
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.shortcut = nn.Identity()
+        out_channels = out_channels or in_channels
+        branch = max(out_channels // 4, 8)
+        self.conv1x1 = nn.Conv2d(in_channels, branch, kernel_size=1)
+        self.conv3x3 = nn.Conv2d(in_channels, branch, kernel_size=3, padding=1)
+        self.conv5x5 = nn.Conv2d(in_channels, branch, kernel_size=5, padding=2)
+        self.conv7x7 = nn.Conv2d(in_channels, branch, kernel_size=7, padding=3)
+        self.fusion = nn.Conv2d(branch * 4, out_channels, kernel_size=1)
+        self.norm = nn.GroupNorm(8, out_channels)
+        self.dropout = nn.Dropout2d(dropout)
+        self.act = nn.SiLU(inplace=True)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
         residual = self.shortcut(x)
-        x1 = self.conv1x1(x)   # 捕获点状特征
-        x3 = self.conv3x3(x)   # 捕获细裂缝
-        x5 = self.conv5x5(x)   # 捕获中等裂缝
-        x7 = self.conv7x7(x)   # 捕获粗裂缝+上下文
-        out = torch.cat([x1, x3, x5, x7], dim=1)  # 拼接: (B, n*4, H, W)
-        out = self.fusion(out)   # 融合: (B, out_channels, H, W)
-        out = self.bn(out)
-        out += residual         # 残差连接: 帮助梯度稳定回传
-        out = self.relu(out)
+        out = torch.cat([
+            self.conv1x1(x),
+            self.conv3x3(x),
+            self.conv5x5(x),
+            self.conv7x7(x)
+        ], dim=1)
+        out = self.fusion(out)
+        out = self.norm(out)
+        out = self.dropout(out)
+        out = self.act(out + residual)
         return out
 
 
-# ================================================================
-# 3. 空洞注意力模块 (2D版本)
-# ================================================================
 class DilateAttention(nn.Module):
-    """
-    空洞注意力模块
-    用3种不同膨胀率(dilation=1,2,4)的空洞卷积构造 V/Q/K
-    膨胀率越大 → 感受野越大 → 能看到更远的上下文信息
-    对裂缝分割很重要: 裂缝周围纹理是判断"这是不是裂缝"的关键线索
-    """
     def __init__(self, in_channel, depth):
         super().__init__()
-        self.batch_norm = nn.BatchNorm2d(in_channel)
-        self.relu = nn.ReLU()
-        # V: 标准卷积, 提取特征值
-        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1, 1)
-        # Q: 膨胀率2, 感受野 5×5
-        self.atrous_block2 = nn.Conv2d(in_channel, depth, 3, 1,
-                                       padding=2, dilation=2, groups=in_channel)
-        # K: 膨胀率4, 感受野 9×9
-        self.atrous_block3 = nn.Conv2d(in_channel, depth, 3, 1,
-                                       padding=4, dilation=4, groups=in_channel)
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        v = self.atrous_block1(x)
-        q = self.atrous_block2(x)
-        k = self.atrous_block3(x)
-        temp = k * q           # 注意力权重图
-        output = v * self.softmax(temp)  # 加权特征
-        output += self.relu(self.batch_norm(x))  # 残差连接
-        return output
-
-
-# ================================================================
-# 4. 主模型: 2D编码器-解码器
-# ================================================================
-class CrackSeg7Band(nn.Module):
-    """
-    2D U-Net 风格编码器-解码器, 适配7波段多光谱输入
-
-    结构示意 (BASE_DIM=16):
-      输入: (B, 7, 224, 224)
-        ↓ enc_conv1(7→16) + pool
-      e1: (B, 16, 112, 112) ──────────────────┐
-        ↓ enc_conv2 + pool                      │ 跳跃连接
-      e2: (B, 16, 56, 56) ───────────────┐     │
-        ↓ enc_conv3 + pool                │     │
-      e3: (B, 16, 28, 28) ──────┐        │     │
-        ↓ bottleneck              │        │     │
-      b:  (B, 16, 28, 28)       │        │     │
-        ↓ up3 + cat(e3) + MSSK  │        │     │
-      d3: (B, 16, 56, 56) ←────┘        │     │
-        ↓ up2 + cat(e2) + MSSK           │     │
-      d2: (B, 16, 112, 112) ←────────────┘     │
-        ↓ up1 + conv                         │
-      d1: (B, 16, 224, 224) ←───────────────┘
-        ↓ final(16→1)
-      输出: (B, 1, 224, 224)
-    """
-    def __init__(self, in_channels=7, classnum=1, base_dim=16):
-        super().__init__()
-        d = base_dim
-
-        # ========== 编码器 (逐步下采样, 提取多级特征) ==========
-        self.enc_conv1 = nn.Conv2d(in_channels, d, kernel_size=7, padding=3)
-        self.enc_bn1   = nn.BatchNorm2d(d)
-        self.pool1     = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.da1       = DilateAttention(d, d)
-
-        self.enc_conv2 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.enc_bn2   = nn.BatchNorm2d(d)
-        self.pool2     = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.da2       = DilateAttention(d, d)
-
-        self.enc_conv3 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.enc_bn3   = nn.BatchNorm2d(d)
-        self.pool3     = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.da3       = DilateAttention(d, d)
-
-        # ========== 瓶颈层 (最深层特征) ==========
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(d, d, kernel_size=7, padding=3),
-            nn.BatchNorm2d(d),
-            nn.ReLU(inplace=True),
+        self.norm = nn.GroupNorm(8, in_channel)
+        self.relu = nn.ReLU(inplace=True)
+        self.v = nn.Conv2d(in_channel, depth, 1, 1)
+        self.q = nn.Conv2d(in_channel, depth, 3, 1, padding=2, dilation=2)
+        self.k = nn.Conv2d(in_channel, depth, 3, 1, padding=4, dilation=4)
+        self.out = nn.Conv2d(depth, depth, kernel_size=1)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(depth, depth, 1),
+            nn.Sigmoid()
         )
 
-        # ========== 解码器 (逐步上采样, 恢复分辨率) ==========
-        self.up3       = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.dec_conv3 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.mssk1     = MSSK(d * 2, d)   # cat后2d通道 → MSSK融合回d通道
-
-        self.up2       = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.dec_conv2 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-        self.mssk2     = MSSK(d * 2, d)
-
-        self.up1       = nn.ConvTranspose2d(d, d, kernel_size=2, stride=2)
-        self.dec_conv1 = nn.Conv2d(d, d, kernel_size=7, padding=3)
-
-        # ========== 输出层: d通道 → 1通道 (裂缝概率图) ==========
-        self.final = nn.Conv2d(d, classnum, kernel_size=1)
-
-        self.relu = nn.ReLU(inplace=True)
-
     def forward(self, x):
-        # ---- 编码器: 逐步缩小分辨率, 提取深层语义特征 ----
-        e1 = self.relu(self.enc_bn1(self.enc_conv1(x)))
-        e1 = self.pool1(e1)    # 224→112
-        e1 = self.da1(e1)
-
-        e2 = self.relu(self.enc_bn2(self.enc_conv2(e1)))
-        e2 = self.pool2(e2)    # 112→56
-        e2 = self.da2(e2)
-
-        e3 = self.relu(self.enc_bn3(self.enc_conv3(e2)))
-        e3 = self.pool3(e3)    # 56→28
-        e3 = self.da3(e3)
-
-        # ---- 瓶颈 ----
-        b = self.bottleneck(e3)
-
-        # ---- 解码器: 逐步恢复分辨率, 跳跃连接补充细节 ----
-        d3 = self.up3(b)                                   # 28→56
-        d3 = self.dec_conv3(d3)
-        d3 = torch.cat([d3, e3], dim=1)                    # 跳跃拼接
-        d3 = self.mssk1(d3)                                # MSSK融合
-
-        d2 = self.up2(d3)                                  # 56→112
-        d2 = self.dec_conv2(d2)
-        d2 = torch.cat([d2, e2], dim=1)                    # 跳跃拼接
-        d2 = self.mssk2(d2)                                # MSSK融合
-
-        d1 = self.up1(d2)                                  # 112→224
-        d1 = self.relu(self.dec_conv1(d1))
-
-        out = self.final(d1)                               # → (B, 1, 224, 224)
+        v = self.v(x)
+        attn = torch.softmax(self.q(x) * self.k(x), dim=1)
+        out = v * attn
+        out = self.out(out)
+        out = out * self.gate(out)
+        out = out + self.relu(self.norm(x))
         return out
 
 
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.fuse = MSSK(out_channels + skip_channels, out_channels, dropout=dropout)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.fuse(x)
+
+
+class CrackSeg7BandV5(nn.Module):
+    def __init__(self, in_channels=7, base_dim=32, dropout=0.18):
+        super().__init__()
+        d = base_dim
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d, d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+        )
+
+        self.enc1 = MSSK(d, d, dropout=dropout)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = MSSK(d, d * 2, dropout=dropout)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = MSSK(d * 2, d * 4, dropout=dropout)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.context = nn.Sequential(
+            DilateAttention(d * 4, d * 4),
+            MSSK(d * 4, d * 4, dropout=dropout),
+            nn.Dropout2d(dropout)
+        )
+
+        self.dec3 = DecoderBlock(d * 4, d * 4, d * 2, dropout)
+        self.dec2 = DecoderBlock(d * 2, d * 2, d, dropout)
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(d, d, kernel_size=2, stride=2),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d, d, kernel_size=3, padding=1),
+            nn.GroupNorm(8, d),
+            nn.SiLU(inplace=True),
+            nn.Dropout2d(dropout)
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(d, d // 2, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(d // 2, 1, kernel_size=1)
+        )
+
+    def forward(self, x):
+        s0 = self.stem(x)           # H
+        s1 = self.enc1(s0)          # H
+        x = self.pool1(s1)          # H/2
+        s2 = self.enc2(x)           # H/2
+        x = self.pool2(s2)          # H/4
+        s3 = self.enc3(x)           # H/4
+        x = self.pool3(s3)          # H/8
+        x = self.context(x)         # H/8
+
+        x = self.dec3(x, s3)        # H/4
+        x = self.dec2(x, s2)        # H/2
+        x = self.dec1(x)            # H
+        if x.shape[-2:] != s1.shape[-2:]:
+            x = F.interpolate(x, size=s1.shape[-2:], mode='bilinear', align_corners=False)
+        x = x + s1
+        x = self.head(x)
+        return x
+
+
 # ================================================================
-# 5. 数据集
+# 5. 数据集与切分
 # ================================================================
-class CrackDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, augment=False):
+class CrackDatasetV5(Dataset):
+    def __init__(self, img_dir, mask_dir, keys, augment=False):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
+        self.keys = list(keys)
         self.augment = augment
-        self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith(".npy")])
-        self.mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith(".npy")])
 
-        # 通过文件名中的关键标识 (如 r1c1col51row39overlap60) 匹配img和mask
-        self.file_mapping = {}
-        for img_file in self.img_files:
-            key = self._extract_key(img_file)
-            self.file_mapping[key] = img_file
+        all_img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+        all_mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+        self.img_map = {extract_key(f): f for f in all_img_files}
+        self.mask_map = {extract_key(f): f for f in all_mask_files}
 
-        missing = [f for f in self.mask_files
-                   if self._extract_key(f) not in self.file_mapping]
-        if missing:
-            print(f"警告: {len(missing)} 个mask找不到对应img")
-
-        assert len(self.file_mapping) > 0, "没有匹配的img/mask文件!"
-        self.valid_keys = list(self.file_mapping.keys())
-        print(f"找到 {len(self.valid_keys)} 对文件")
-
-    def _extract_key(self, filename):
-        filename = filename.replace('.npy', '')
-        for part in filename.split('_'):
-            if 'r' in part and 'c' in part and 'col' in part and 'row' in part:
-                return part
-        return filename
+        missing_img = [k for k in self.keys if k not in self.img_map]
+        missing_mask = [k for k in self.keys if k not in self.mask_map]
+        if missing_img:
+            raise RuntimeError(f"以下 key 缺少图像文件: {missing_img[:10]}")
+        if missing_mask:
+            raise RuntimeError(f"以下 key 缺少掩码文件: {missing_mask[:10]}")
 
     def __len__(self):
-        return len(self.valid_keys)
+        return len(self.keys)
+
+    def _normalize(self, img):
+        # 通道独立的稳健百分位归一化，降低单个异常波段极值对整块样本的影响
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(img.shape[0]):
+            band = img[c].astype(np.float32)
+            lo = np.percentile(band, 1.0)
+            hi = np.percentile(band, 99.0)
+            if hi - lo < 1e-6:
+                out[c] = np.zeros_like(band, dtype=np.float32)
+            else:
+                band = np.clip(band, lo, hi)
+                out[c] = (band - lo) / (hi - lo)
+        return out
+
+    def _augment(self, img, mask):
+        if random.random() < 0.5:
+            img = img[:, :, ::-1].copy()
+            mask = mask[:, ::-1].copy()
+        if random.random() < 0.5:
+            img = img[:, ::-1, :].copy()
+            mask = mask[::-1, :].copy()
+        if random.random() < 0.5:
+            k = random.choice([1, 2, 3])
+            img = np.rot90(img, k, axes=(1, 2)).copy()
+            mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+        if random.random() < CFG.band_noise_prob:
+            noise = np.random.normal(0.0, 0.015, size=img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
+
+        if random.random() < 0.35:
+            gain = np.random.uniform(0.92, 1.08, size=(img.shape[0], 1, 1)).astype(np.float32)
+            bias = np.random.uniform(-0.03, 0.03, size=(img.shape[0], 1, 1)).astype(np.float32)
+            img = np.clip(img * gain + bias, 0.0, 1.0)
+
+        if random.random() < CFG.band_drop_prob:
+            drop_count = 1 if img.shape[0] <= 7 else 2
+            drop_idx = np.random.choice(img.shape[0], drop_count, replace=False)
+            img[drop_idx] = 0.0
+
+        if random.random() < CFG.cutout_prob:
+            h, w = mask.shape
+            ch = min(CFG.cutout_size, h)
+            cw = min(CFG.cutout_size, w)
+            cy = np.random.randint(0, max(1, h - ch + 1))
+            cx = np.random.randint(0, max(1, w - cw + 1))
+            img[:, cy:cy + ch, cx:cx + cw] = 0.0
+
+        return img, mask
 
     def __getitem__(self, idx):
-        key = self.valid_keys[idx]
-        img_file  = self.file_mapping[key]
-        mask_file = f"all_bands_mosaic_crack46all_classic_mask_classic_{key}.npy"
+        key = self.keys[idx]
+        img_file = self.img_map[key]
+        mask_file = self.mask_map[key]
 
-        img_path  = os.path.join(self.img_dir, img_file)
-        mask_path = os.path.join(self.mask_dir, mask_file)
-
-        img  = np.load(img_path)    # (7, 224, 224) float
-        mask = np.load(mask_path)   # (224, 224) 或 (1, 224, 224) int
-
+        img = np.load(os.path.join(self.img_dir, img_file)).astype(np.float32)
+        mask = np.load(os.path.join(self.mask_dir, mask_file)).astype(np.float32)
         if mask.ndim == 3 and mask.shape[0] == 1:
             mask = mask.squeeze(0)
 
-        # 逐样本归一化到 [0, 1]
-        img_min, img_max = img.min(), img.max()
-        if img_max - img_min > 1e-8:
-            img = (img - img_min) / (img_max - img_min)
-        else:
-            img = np.zeros_like(img)
+        img = self._normalize(img)
+        mask = (mask > 0.5).astype(np.float32)
 
-        # 数据增强 (对所有7个波段同步操作, 保持波段间对应关系)
         if self.augment:
-            if random.random() > AUG_PROB:          # 水平翻转
-                img = img[:, :, ::-1].copy()
-                mask = mask[:, ::-1].copy()
-            if random.random() > AUG_PROB:          # 垂直翻转
-                img = img[:, ::-1, :].copy()
-                mask = mask[::-1, :].copy()
-            if random.random() > AUG_PROB:          # 旋转90/180/270°
-                k = random.choice([1, 2, 3])
-                img  = np.rot90(img,  k, axes=(1, 2)).copy()
-                mask = np.rot90(mask, k, axes=(0, 1)).copy()
+            img, mask = self._augment(img, mask)
 
-        img = img.astype(np.float32)
-        return torch.from_numpy(img), torch.from_numpy(mask.astype(np.int64)), img_file
+        return torch.from_numpy(img), torch.from_numpy(mask), img_file
+
+
+def collect_valid_keys(img_dir, mask_dir):
+    img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.npy')])
+    mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith('.npy')])
+    img_map = {extract_key(f): f for f in img_files}
+    mask_map = {extract_key(f): f for f in mask_files}
+    mask_keys = set(mask_map.keys())
+    valid_keys = sorted([k for k in img_map.keys() if k in mask_keys])
+    if not valid_keys:
+        raise RuntimeError("没有找到匹配的 img / mask 数据对")
+    return valid_keys
+
+
+def grouped_train_val_split(keys, train_ratio=0.75, val_ratio_within_trainval=0.20, seed=42):
+    group_map = {}
+    for key in keys:
+        gid = extract_group_id(key)
+        group_map.setdefault(gid, []).append(key)
+
+    groups = sorted(group_map.keys())
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+
+    total = len(keys)
+    trainval_target = max(1, int(total * train_ratio))
+    trainval_keys, holdout_keys = [], []
+
+    for gid in groups:
+        current = group_map[gid]
+        if len(trainval_keys) < trainval_target:
+            trainval_keys.extend(current)
+        else:
+            holdout_keys.extend(current)
+
+    if len(holdout_keys) == 0:
+        split_point = max(1, len(trainval_keys) // 5)
+        holdout_keys = trainval_keys[-split_point:]
+        trainval_keys = trainval_keys[:-split_point]
+
+    trainval_groups = sorted({extract_group_id(k) for k in trainval_keys})
+    rng.shuffle(trainval_groups)
+    val_target = max(1, int(len(trainval_keys) * val_ratio_within_trainval))
+
+    train_keys, val_keys = [], []
+    for gid in trainval_groups:
+        current = group_map[gid]
+        if len(val_keys) < val_target:
+            val_keys.extend(current)
+        else:
+            train_keys.extend(current)
+
+    if len(train_keys) == 0:
+        split_point = max(1, len(val_keys) // 2)
+        train_keys = val_keys[split_point:]
+        val_keys = val_keys[:split_point]
+
+    return sorted(train_keys), sorted(val_keys), sorted(holdout_keys)
 
 
 # ================================================================
-# 6. 损失函数 (Dice + BCE + Focal 三重损失)
+# 6. 损失函数
 # ================================================================
-class DiceBCEFocalLoss(nn.Module):
-    """
-    三重损失组合:
-    - BCE (加权): 基础分类损失, pos_weight=80 解决正负样本极度不平衡
-    - Dice: 直接优化分割区域重叠度, 对小目标(裂缝)更敏感
-    - Focal: 聚焦难分样本, gamma=2.5 让模型更关注分类错误的像素
-    """
-    def __init__(self, pos_weight=80.0, dice_weight=0.35,
-                 bce_weight=0.35, focal_weight=0.30, focal_gamma=2.5):
+class PrecisionAwareSegLoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.dice_weight  = dice_weight
-        self.bce_weight   = bce_weight
-        self.focal_weight = focal_weight
-        self.focal_gamma  = focal_gamma
-        self.register_buffer('pos_weight_tensor', torch.tensor([pos_weight]))
+        self.register_buffer('pos_weight_tensor', torch.tensor([CFG.pos_weight], dtype=torch.float32))
 
     def forward(self, logits, target):
-        if target.dim() == 4 and target.shape[1] == 1:
-            target = target.squeeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+        probs = torch.sigmoid(logits)
 
-        logits_flat = logits.view(-1)
-        target_flat = target.view(-1).float()
-        probs = torch.sigmoid(logits_flat)
+        target_smooth = target * (1.0 - CFG.label_smoothing) + 0.5 * CFG.label_smoothing
 
-        # 1. 加权BCE
         bce = F.binary_cross_entropy_with_logits(
-            logits_flat, target_flat,
-            pos_weight=self.pos_weight_tensor.to(logits.device))
+            logits,
+            target_smooth,
+            pos_weight=self.pos_weight_tensor.to(logits.device)
+        )
 
-        # 2. Dice
-        intersection = (probs * target_flat).sum()
-        dice_loss = 1.0 - (2.0 * intersection + 1e-7) / \
-                    (probs.sum() + target_flat.sum() + 1e-7)
+        dims = (0, 2, 3)
+        tp = (probs * target).sum(dims)
+        fp = (probs * (1.0 - target)).sum(dims)
+        fn = ((1.0 - probs) * target).sum(dims)
+        tversky = 1.0 - (tp + 1e-7) / (tp + CFG.tversky_alpha * fp + CFG.tversky_beta * fn + 1e-7)
+        tversky = tversky.mean()
 
-        # 3. Focal
-        p_clamped = torch.clamp(probs, min=1e-7, max=1 - 1e-7)
-        p_t = p_clamped * target_flat + (1 - p_clamped) * (1 - target_flat)
-        focal_w = (1 - p_t) ** self.focal_gamma
-        focal_loss = (focal_w * F.binary_cross_entropy_with_logits(
-            logits_flat, target_flat, reduction='none')).mean()
+        p_t = probs * target + (1.0 - probs) * (1.0 - target)
+        focal = ((1.0 - p_t).pow(CFG.focal_gamma) * F.binary_cross_entropy_with_logits(
+            logits, target_smooth, reduction='none'
+        )).mean()
 
-        return self.bce_weight * bce + self.dice_weight * dice_loss + \
-               self.focal_weight * focal_loss
+        neg_probs = probs[target < 0.5]
+        if neg_probs.numel() > 0:
+            k = max(1, int(neg_probs.numel() * CFG.hard_negative_ratio))
+            hard_negative_penalty = torch.topk(neg_probs, k=k).values.mean()
+        else:
+            hard_negative_penalty = logits.new_tensor(0.0)
+
+        return (
+            CFG.bce_weight * bce +
+            CFG.tversky_weight * tversky +
+            CFG.focal_weight * focal +
+            CFG.hard_negative_weight * hard_negative_penalty
+        )
 
 
 # ================================================================
-# 7. 评估与可视化
+# 7. 指标与阈值搜索
 # ================================================================
 @torch.no_grad()
-def compute_metrics(model, loader, criterion, device, threshold=PRED_THRESHOLD):
-    """计算 IoU, F1, Precision, Recall 四项指标"""
+def collect_predictions(model, loader, device):
     model.eval()
-    total_loss, tp, fp, fn = 0.0, 0.0, 0.0, 0.0
+    total_loss = 0.0
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
+    criterion = PrecisionAwareSegLoss().to(device)
 
     for imgs, masks, _ in loader:
-        imgs, masks = imgs.to(device), masks.to(device)
-
-        with torch.amp.autocast('cuda'):
-            out = model(imgs)
-            loss = criterion(out, masks)
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            logits = model(imgs)
+            loss = criterion(logits, masks)
         total_loss += loss.item()
 
-        # 注意: squeeze(1) 去掉通道维, 避免 (B,1,H,W) & (B,H,W) 的广播错误
-        pred = (torch.sigmoid(out) > threshold).long().squeeze(1)
+        probs = torch.sigmoid(logits)
+        pred = (probs > CFG.default_threshold).long().squeeze(1)
+        true = (masks > 0.5).long()
 
-        tp += ((pred == 1) & (masks == 1)).sum().float()
-        fp += ((pred == 1) & (masks == 0)).sum().float()
-        fn += ((pred == 0) & (masks == 1)).sum().float()
+        total_tp += ((pred == 1) & (true == 1)).sum().item()
+        total_fp += ((pred == 1) & (true == 0)).sum().item()
+        total_fn += ((pred == 0) & (true == 1)).sum().item()
 
+    if len(loader) == 0:
+        return 0.0, {'IoU': 0.0, 'F1': 0.0, 'Precision': 0.0, 'Recall': 0.0}
+
+    metrics = compute_metrics_from_counts(total_tp, total_fp, total_fn)
+    return total_loss / max(len(loader), 1), metrics
+
+
+def compute_metrics_from_counts(tp, fp, fn):
     eps = 1e-7
     precision = (tp + eps) / (tp + fp + eps)
-    recall    = (tp + eps) / (tp + fn + eps)
-    f1        = 2 * precision * recall / (precision + recall + eps)
-    iou       = (tp + eps) / (tp + fp + fn + eps)
+    recall = (tp + eps) / (tp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    iou = (tp + eps) / (tp + fp + fn + eps)
 
-    return total_loss / max(len(loader), 1), {
-        'Precision': precision.item(),
-        'Recall':    recall.item(),
-        'F1':        f1.item(),
-        'IoU':       iou.item()
+    return {
+        'Precision': precision,
+        'Recall': recall,
+        'F1': f1,
+        'IoU': iou,
     }
 
 
-def save_prediction_figure(model, dataset, device, save_path,
-                           epoch, indices, band_idx, threshold):
-    """保存预测可视化图: 输入波段 | 真实掩码 | 预测结果"""
-    model.eval()
-    n = len(indices)
-    fig, axes = plt.subplots(n, 3, figsize=(15, 5 * n))
-    if n == 1:
-        axes = axes[np.newaxis, :]
+# ================================================================
+# 8. 可视化与日志
+# ================================================================
+class TrainingLogger:
+    def __init__(self, path):
+        self.path = path
+        self.h = {
+            'epoch': [],
+            'train_loss': [],
+            'val_loss': [],
+            'iou': [],
+            'f1': [],
+            'precision': [],
+            'recall': [],
+            'lr': [],
+            'score': [],
+            'best_score': None,
+            'best_epoch': None,
+        }
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            for k in self.h:
+                if k in saved:
+                    self.h[k] = saved[k]
 
-    band_names = ['397.5nm', '456.4nm', '532.7nm', '577.8nm',
-                  '903.9nm', '935.1nm', '942.0nm']
+    def log(self, epoch, train_loss, val_loss, metrics, lr, score, best_score):
+        self.h['epoch'].append(int(epoch))
+        self.h['train_loss'].append(float(train_loss))
+        self.h['val_loss'].append(float(val_loss))
+        self.h['iou'].append(float(metrics['IoU']))
+        self.h['f1'].append(float(metrics['F1']))
+        self.h['precision'].append(float(metrics['Precision']))
+        self.h['recall'].append(float(metrics['Recall']))
+        self.h['lr'].append(float(lr))
+        self.h['score'].append(float(score))
+        self.h['best_score'] = float(best_score)
+        self.h['best_epoch'] = int(self.h['epoch'][int(np.argmax(self.h['score']))]) if self.h['score'] else None
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self.h, f, indent=2, ensure_ascii=False)
+
+    def plot(self, path):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        axes[0, 0].plot(self.h['train_loss'], label='Train Loss')
+        axes[0, 0].plot(self.h['val_loss'], label='Val Loss')
+        axes[0, 0].set_title('Loss Curve')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        axes[0, 1].plot(self.h['iou'], label='IoU')
+        axes[0, 1].plot(self.h['f1'], label='F1', color='tab:orange')
+        axes[0, 1].plot(self.h['score'], label='Score', color='tab:purple')
+        axes[0, 1].set_title('Validation Metrics')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        axes[1, 0].plot(self.h['precision'], label='Precision', color='tab:green')
+        axes[1, 0].plot(self.h['recall'], label='Recall', color='tab:red')
+        axes[1, 0].set_title('Precision / Recall Balance')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        axes[1, 1].plot(self.h['lr'], label='Learning Rate', color='tab:brown')
+        axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+
+
+def save_prediction_figure(model, dataset, device, save_path, epoch, threshold):
+    model.eval()
+    count = min(CFG.viz_sample_count, len(dataset))
+    if count == 0:
+        return
+
+    fig, axes = plt.subplots(count, 4, figsize=(16, 4 * count))
+    if count == 1:
+        axes = np.expand_dims(axes, axis=0)
 
     with torch.no_grad():
-        for i, idx in enumerate(indices):
-            img, mask, _ = dataset[idx]
+        for i in range(count):
+            img, mask, name = dataset[i]
             inp = img.unsqueeze(0).to(device)
-            out = model(inp)
-            pred = (torch.sigmoid(out).squeeze().cpu().numpy() > threshold) \
-                   .astype(np.float32)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(inp)
+            prob = torch.sigmoid(logits).squeeze().cpu().numpy()
+            pred = (prob > threshold).astype(np.float32)
+            band_idx = min(CFG.viz_band_idx, img.shape[0] - 1)
 
-            b = min(band_idx, img.shape[0] - 1)
-            axes[i, 0].imshow(img[b].numpy(), cmap='gray')
-            axes[i, 0].set_title(f'Band {b} ({band_names[b]})')
+            axes[i, 0].imshow(img[band_idx].numpy(), cmap='gray')
+            axes[i, 0].set_title(f'Input: {name}')
             axes[i, 0].axis('off')
 
-            axes[i, 1].imshow(mask.numpy(), cmap='gray')
-            axes[i, 1].set_title('Ground Truth')
+            axes[i, 1].imshow(mask.numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[i, 1].set_title('Mask')
             axes[i, 1].axis('off')
 
-            axes[i, 2].imshow(pred, cmap='gray')
-            axes[i, 2].set_title('Prediction')
+            im = axes[i, 2].imshow(prob, cmap='jet', vmin=0, vmax=1)
+            axes[i, 2].set_title('Probability')
             axes[i, 2].axis('off')
+            plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.04)
+
+            axes[i, 3].imshow(pred, cmap='gray', vmin=0, vmax=1)
+            axes[i, 3].set_title(f'Binary @ {threshold:.3f}')
+            axes[i, 3].axis('off')
 
     plt.suptitle(f'Epoch {epoch}', fontsize=14)
     plt.tight_layout()
-    fig.savefig(save_path, dpi=100)
+    fig.savefig(save_path, dpi=120)
     plt.close(fig)
 
 
 # ================================================================
-# 8. 训练日志
+# 9. 学习率调度
 # ================================================================
-class TrainingLogger:
-    """记录训练过程指标, 支持断点续训时自动读取历史记录"""
-    def __init__(self, path):
-        self.path = path
-        self.h = {'train_loss': [], 'val_loss': [], 'iou': [], 'f1': [],
-                  'precision': [], 'recall': [], 'lr': []}
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                self.h = json.load(f)
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, total_epochs, warmup_epochs, min_lr):
+        self.optimizer = optimizer
+        self.total_epochs = total_epochs
+        self.warmup_epochs = max(1, warmup_epochs)
+        self.min_lr = min_lr
+        self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self.last_epoch = 0
 
-    def log(self, ep, tl, vl, m, lr):
-        self.h['train_loss'].append(tl)
-        self.h['val_loss'].append(vl)
-        self.h['iou'].append(m['IoU'])
-        self.h['f1'].append(m['F1'])
-        self.h['precision'].append(m['Precision'])
-        self.h['recall'].append(m['Recall'])
-        self.h['lr'].append(lr)
-        with open(self.path, 'w') as f:
-            json.dump(self.h, f, indent=2)
+    def step(self):
+        self.last_epoch += 1
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * self.last_epoch / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
 
-    def plot(self, path):
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        axes[0, 0].plot(self.h['train_loss'], label='Train')
-        axes[0, 0].plot(self.h['val_loss'], label='Val')
-        axes[0, 0].set_title('Loss'); axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
+    def state_dict(self):
+        return {'last_epoch': self.last_epoch}
 
-        axes[0, 1].plot(self.h['iou'], label='IoU')
-        axes[0, 1].plot(self.h['f1'], label='F1')
-        axes[0, 1].set_title('Metrics'); axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-
-        axes[1, 0].plot(self.h['precision'], label='Precision')
-        axes[1, 0].plot(self.h['recall'], label='Recall')
-        axes[1, 0].set_title('PR Curve'); axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-
-        axes[1, 1].plot(self.h['lr'], label='LR', color='red')
-        axes[1, 1].set_title('Learning Rate')
-        axes[1, 1].set_yscale('log'); axes[1, 1].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        fig.savefig(path, dpi=100)
-        plt.close(fig)
+    def load_state_dict(self, state_dict):
+        self.last_epoch = state_dict.get('last_epoch', 0)
+        # 恢复后立即同步一次当前 lr
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            base_lr = self.base_lrs[i]
+            if self.last_epoch <= self.warmup_epochs:
+                lr = base_lr * max(1, self.last_epoch) / self.warmup_epochs
+            else:
+                progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (base_lr - self.min_lr) * cosine
+            param_group['lr'] = lr
 
 
 # ================================================================
-# 9. 主训练循环
+# 10. 训练主流程
 # ================================================================
 def main():
-    set_seed(SEED)
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    set_seed(CFG.seed)
+    ensure_dirs()
+    save_config()
 
-    # ---- 数据集划分 (7:3 训练:验证) ----
-    full_dataset = CrackDataset(train_img_dir, train_mask_dir, augment=False)
-    train_size = int(0.7 * len(full_dataset))
-    train_indices, val_indices = random_split(
-        range(len(full_dataset)),
-        [train_size, len(full_dataset) - train_size],
-        generator=torch.Generator().manual_seed(SEED)
+    valid_keys = collect_valid_keys(IMG_DIR, MASK_DIR)
+    train_keys, val_keys = grouped_train_val_split(valid_keys, CFG.train_ratio, CFG.seed)
+
+    train_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, train_keys, augment=True)
+    val_ds = CrackDatasetV5(IMG_DIR, MASK_DIR, val_keys, augment=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CFG.batch_size,
+        shuffle=True,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        drop_last=len(train_ds) >= CFG.batch_size,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        pin_memory=True,
+        persistent_workers=False,
     )
 
-    # 训练集开启数据增强, 验证集不增强
-    train_ds = torch.utils.data.Subset(
-        CrackDataset(train_img_dir, train_mask_dir, augment=True),
-        train_indices.indices)
-    val_ds = torch.utils.data.Subset(full_dataset, val_indices.indices)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"设备: {device}")
+    print(f"数据根目录: {DATA_ROOT}")
+    print(f"训练样本: {len(train_ds)} | 验证样本: {len(val_ds)}")
 
-    # --- [调整5] persistent_workers=False (Windows必须) ---
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True,
-                              drop_last=True, persistent_workers=False)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=NUM_WORKERS, pin_memory=True,
-                            persistent_workers=False)
+    train_groups = sorted({extract_group_id(k) for k in train_keys})
+    val_groups = sorted({extract_group_id(k) for k in val_keys})
+    print(f"训练分组数: {len(train_groups)} | 验证分组数: {len(val_groups)}")
 
-    # ---- 模型 ----
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CrackSeg7Band(in_channels=IN_CHANNELS, classnum=1,
-                          base_dim=BASE_DIM).to(device)
+    model = CrackSeg7BandV5(
+        in_channels=CFG.in_channels,
+        base_dim=CFG.base_dim,
+        dropout=CFG.dropout
+    ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    train_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024 / 1024
-    print(f"设备: {device}")
-    print(f"模型参数量: {total_params:,} ({train_size_mb:.1f} MB)")
-    print(f"BASE_DIM={BASE_DIM}, BATCH_SIZE={BATCH_SIZE}, IN_CHANNELS={IN_CHANNELS}")
+    print(f"模型参数量: {total_params:,}")
 
-    # ---- 日志与断点续训 ----
+    criterion = PrecisionAwareSegLoss().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    scheduler = WarmupCosineScheduler(optimizer, CFG.epochs, CFG.warmup_epochs, CFG.min_lr)
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    ema = EMA(model, decay=CFG.ema_decay)
     logger = TrainingLogger(TRAIN_LOG)
-    start_epoch = len(logger.h['train_loss']) if logger.h['train_loss'] else 0
-    if start_epoch > 0:
-        print(f"检测到历史记录, 从第 {start_epoch + 1} 轮继续训练")
 
-    # ---- 损失函数 ----
-    criterion = DiceBCEFocalLoss(pos_weight=POS_WEIGHT).to(device)
+    start_epoch = 0
+    best_score = -1.0
+    best_metrics = None
+    patience_counter = 0
 
-    # ---- 优化器 + 学习率调度 ----
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    if os.path.exists(LATEST_CHECKPOINT):
+        print(f"发现断点文件，恢复训练: {LATEST_CHECKPOINT}")
+        ckpt = torch.load(LATEST_CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        scaler.load_state_dict(ckpt['scaler_state_dict'])
+        ema.shadow = {k: v.to(device) for k, v in ckpt['ema_shadow'].items()}
+        start_epoch = ckpt['epoch']
+        best_score = ckpt.get('best_score', -1.0)
+        best_metrics = ckpt.get('best_metrics', None)
+        patience_counter = ckpt.get('patience_counter', 0)
 
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=15,
-        verbose=True, min_lr=1e-7)
+    print("=" * 68)
+    print("7 波段训练 v5：Precision 优先 + 分组验证 + 快速收敛")
+    print(f"epochs={CFG.epochs}, batch={CFG.batch_size}, lr={CFG.lr}, min_lr={CFG.min_lr}")
+    print(f"pos_weight={CFG.pos_weight}, tversky_alpha={CFG.tversky_alpha}, tversky_beta={CFG.tversky_beta}")
+    print(f"hard_negative_ratio={CFG.hard_negative_ratio}, patience={CFG.patience}, thr={CFG.default_threshold:.2f}")
+    print("=" * 68)
 
-    # 混合精度训练 (RTX 2080 支持FP16, 约省一半显存, 训练更快)
-    scaler = torch.amp.GradScaler('cuda')
-
-    trigger = 0
-    best_iou = max(logger.h['iou']) if logger.h['iou'] else 0.0
-
-    # ===================== 训练循环 =====================
-    for epoch in range(start_epoch, EPOCHS):
+    for epoch in range(start_epoch, CFG.epochs):
         ep = epoch + 1
         model.train()
-        t_loss, n_b = 0.0, 0
+        running_loss = 0.0
+        batch_count = 0
 
-        for imgs, masks, _ in tqdm(train_loader, desc=f"Epoch {ep:03d}"):
-            imgs, masks = imgs.to(device), masks.to(device)
+        pbar = tqdm(train_loader, desc=f"Epoch {ep:03d}", dynamic_ncols=True)
+        for imgs, masks, _ in pbar:
+            imgs = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            if CFG.mixup_alpha > 0.0 and random.random() < 0.25:
+                imgs, masks = beta_mixup(imgs, masks, CFG.mixup_alpha, device)
 
             optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                logits = model(imgs)
+                loss = criterion(logits, masks)
 
-            # 混合精度前向传播
-            with torch.amp.autocast('cuda'):
-                out = model(imgs)
-                loss = criterion(out, masks)
-
-            # 反向传播 + 梯度裁剪
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            ema.update()
 
-            t_loss += loss.item()
-            n_b += 1
+            running_loss += loss.item()
+            batch_count += 1
+            pbar.set_postfix(loss=f"{running_loss / batch_count:.4f}")
 
-        # ---- 验证 ----
-        v_loss, metrics = compute_metrics(
-            model, val_loader, criterion, device, PRED_THRESHOLD)
-        lr = optimizer.param_groups[0]['lr']
-        scheduler.step(metrics['IoU'])
+        scheduler.step()
 
-        # ---- 保存最优模型 ----
-        msg = ""
-        if metrics['IoU'] > best_iou:
-            best_iou = metrics['IoU']
-            trigger = 0
-            msg = " >>> Best IoU!"
-            torch.save(model.state_dict(), CHECKPOINT)
+        if batch_count == 0:
+            continue
+
+        ema.apply_shadow()
+        val_loss, metrics = collect_predictions(model, val_loader, device)
+        ema.restore()
+
+        train_loss = running_loss / batch_count
+        current_lr = optimizer.param_groups[0]['lr']
+        score = compute_balance_score(metrics)
+
+        improved = score > best_score
+        if improved:
+            best_score = score
+            best_metrics = copy.deepcopy(metrics)
+            patience_counter = 0
+            ema.apply_shadow()
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'best_threshold': CFG.default_threshold,
+                'best_metrics': best_metrics,
+                'best_score': best_score,
+                'config': asdict(CFG),
+            }, CHECKPOINT)
+            ema.restore()
+            tag = ' >>> Best Score!'
         else:
-            trigger += 1
-            msg = f" Wait({trigger}/{PATIENCE})"
+            patience_counter += 1
+            tag = f' Wait({patience_counter}/{CFG.patience})'
 
-        logger.log(ep, t_loss / n_b, v_loss, metrics, lr)
+        logger.log(ep, train_loss, val_loss, metrics, current_lr, score, best_score)
 
-        print(f"Ep{ep:03d} | Tr:{t_loss/n_b:.4f} Va:{v_loss:.4f} | "
-              f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} | "
-              f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} | "
-              f"LR:{lr:.2e}{msg}")
+        torch.save({
+            'epoch': ep,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'ema_shadow': ema.shadow,
+            'best_score': best_score,
+            'best_metrics': best_metrics,
+            'patience_counter': patience_counter,
+        }, LATEST_CHECKPOINT)
 
-        # ---- 可视化 (每30轮保存一次预测图) ----
-        if ep % VIZ_EVERY == 0:
+        print(
+            f"Ep{ep:03d} | Tr:{train_loss:.4f} Va:{val_loss:.4f} | "
+            f"IoU:{metrics['IoU']:.4f} F1:{metrics['F1']:.4f} | "
+            f"Prec:{metrics['Precision']:.4f} Rec:{metrics['Recall']:.4f} | "
+            f"Score:{score:.4f} | Thr:{CFG.default_threshold:.3f} LR:{current_lr:.2e}{tag}"
+        )
+
+        if CFG.viz_every > 0 and ep % CFG.viz_every == 0:
+            ema.apply_shadow()
             save_prediction_figure(
-                model, val_ds, device,
+                model,
+                val_ds,
+                device,
                 os.path.join(OUTPUT_ROOT, f"viz_ep{ep:03d}.png"),
-                ep, VIZ_SAMPLE_INDICES, VIZ_BAND_IDX, PRED_THRESHOLD)
+                ep,
+                CFG.default_threshold
+            )
+            ema.restore()
 
-        # ---- 早停 ----
-        if trigger >= PATIENCE:
-            print(f"早停: 连续 {PATIENCE} 轮无改善, 训练结束")
+        if patience_counter >= CFG.patience:
+            print(f"早停触发：连续 {CFG.patience} 个 epoch 综合得分未提升。")
             break
 
-    # ---- 训练结束, 绘制曲线 ----
-    logger.plot(os.path.join(OUTPUT_ROOT, "training_curves_7band.png"))
-    print(f"\n{'='*50}")
-    print(f"训练完成! 最佳 IoU: {best_iou:.4f}")
-    print(f"模型保存: {CHECKPOINT}")
-    print(f"训练曲线: {OUTPUT_ROOT}\\training_curves_7band.png")
-    print(f"{'='*50}")
+    logger.plot(os.path.join(OUTPUT_ROOT, "training_curves_7band_v5.png"))
+    print("=" * 68)
+    print("训练完成")
+    print(f"最佳综合分数: {best_score:.4f}")
+    print(f"固定阈值: {CFG.default_threshold:.3f}")
+    if best_metrics is not None:
+        print(
+            f"最佳指标 => IoU:{best_metrics['IoU']:.4f}, F1:{best_metrics['F1']:.4f}, "
+            f"Precision:{best_metrics['Precision']:.4f}, Recall:{best_metrics['Recall']:.4f}"
+        )
+    print(f"最佳模型: {CHECKPOINT}")
+    print(f"断点文件: {LATEST_CHECKPOINT}")
+    print(f"配置文件: {CONFIG_PATH}")
+    print("=" * 68)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
