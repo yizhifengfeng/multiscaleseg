@@ -64,24 +64,21 @@ class Config:
     seed: int = 42
 
     train_ratio: float = 0.75
-    val_ratio_within_trainval: float = 0.20
     base_dim: int = 32
     dropout: float = 0.18
     ema_decay: float = 0.998
 
     # 旧版本正样本惩罚过强，导致 recall 高、precision 低
-    pos_weight: float = 2.2
-    bce_weight: float = 0.24
-    tversky_weight: float = 0.36
-    focal_weight: float = 0.18
-    hard_negative_weight: float = 0.12
-    background_weight: float = 0.10
+    pos_weight: float = 3.5
+    bce_weight: float = 0.30
+    tversky_weight: float = 0.45
+    focal_weight: float = 0.15
+    hard_negative_weight: float = 0.10
     focal_gamma: float = 2.0
-    tversky_alpha: float = 0.62   # 保持对 FP 的惩罚，但不过度压制召回
-    tversky_beta: float = 0.38
-    label_smoothing: float = 0.01
-    hard_negative_ratio: float = 0.05
-    empty_mask_loss_scale: float = 1.20
+    tversky_alpha: float = 0.72   # 更高 alpha => 更重罚 FP
+    tversky_beta: float = 0.28
+    label_smoothing: float = 0.02
+    hard_negative_ratio: float = 0.02
 
     mixup_alpha: float = 0.0      # 分割任务中对细裂缝会模糊边界，默认关闭
     band_drop_prob: float = 0.15
@@ -89,8 +86,6 @@ class Config:
     cutout_prob: float = 0.25
     cutout_size: int = 20
 
-    threshold_candidates: tuple = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
-    min_precision_floor: float = 0.55
     default_threshold: float = 0.55
 
     viz_every: int = 0
@@ -469,7 +464,7 @@ def collect_valid_keys(img_dir, mask_dir):
     return valid_keys
 
 
-def grouped_train_val_split(keys, train_ratio=0.75, val_ratio_within_trainval=0.20, seed=42):
+def grouped_train_val_split(keys, train_ratio=0.75, seed=42):
     group_map = {}
     for key in keys:
         gid = extract_group_id(key)
@@ -480,39 +475,21 @@ def grouped_train_val_split(keys, train_ratio=0.75, val_ratio_within_trainval=0.
     rng.shuffle(groups)
 
     total = len(keys)
-    trainval_target = max(1, int(total * train_ratio))
-    trainval_keys, holdout_keys = [], []
+    train_target = int(total * train_ratio)
+    train_keys, val_keys = [], []
 
     for gid in groups:
         current = group_map[gid]
-        if len(trainval_keys) < trainval_target:
-            trainval_keys.extend(current)
-        else:
-            holdout_keys.extend(current)
-
-    if len(holdout_keys) == 0:
-        split_point = max(1, len(trainval_keys) // 5)
-        holdout_keys = trainval_keys[-split_point:]
-        trainval_keys = trainval_keys[:-split_point]
-
-    trainval_groups = sorted({extract_group_id(k) for k in trainval_keys})
-    rng.shuffle(trainval_groups)
-    val_target = max(1, int(len(trainval_keys) * val_ratio_within_trainval))
-
-    train_keys, val_keys = [], []
-    for gid in trainval_groups:
-        current = group_map[gid]
-        if len(val_keys) < val_target:
-            val_keys.extend(current)
-        else:
+        if len(train_keys) < train_target:
             train_keys.extend(current)
+        else:
+            val_keys.extend(current)
 
-    if len(train_keys) == 0:
-        split_point = max(1, len(val_keys) // 2)
-        train_keys = val_keys[split_point:]
-        val_keys = val_keys[:split_point]
+    if len(val_keys) == 0:
+        val_keys = train_keys[-max(1, len(train_keys) // 5):]
+        train_keys = train_keys[:-len(val_keys)]
 
-    return sorted(train_keys), sorted(val_keys), sorted(holdout_keys)
+    return sorted(train_keys), sorted(val_keys)
 
 
 # ================================================================
